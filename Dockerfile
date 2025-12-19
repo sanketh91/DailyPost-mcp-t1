@@ -1,5 +1,7 @@
 # Use official Python runtime
 FROM python:3.11-slim
+# Install build dependencies for packages like hdbscan
+RUN apt-get update && apt-get install -y build-essential python3-dev && rm -rf /var/lib/apt/lists/*
 
 # Install uv for faster dependency installation (optional but recommended)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
