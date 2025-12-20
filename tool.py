@@ -16,11 +16,15 @@ from typing import Any, Dict, List, Optional
 import weaviate
 from weaviate.classes.backup import BackupStorage
 from sentence_transformers import SentenceTransformer
-from weaviate.classes.query import Filter, MetadataQuery
+from weaviate.classes.query import Filter, MetadataQuery, Sort
 
 # Import dynamic tool framework
 from dynamic_tool_registry import get_dynamic_registry
 from dynamic_tools_framework import DynamicToolGenerator
+
+# Style guide constants
+STYLE_GUIDE_PATH = "./sanjay_sahay_style.txt"
+MIN_POSTS_FOR_PATTERN = 5
 
 # mcp will be set by mcp_server.py before tools are registered
 mcp = None
@@ -72,6 +76,9 @@ def register_tools():
     mcp.tool()(backup_weaviate)
     mcp.tool()(restore_backup)
     mcp.tool()(export_all_data)
+    mcp.tool()(get_posts_for_daily)
+    mcp.tool()(add_writing_pattern)
+    mcp.tool()(get_style_guide)
     
     print("Static tools registered successfully", file=sys.stderr)
 
@@ -198,7 +205,7 @@ def search_posts_hybrid(
             )
         
         if topic_filter:
-            filters.append(Filter.by_property("topic_name").equal(topic_filter))
+            filters.append(Filter.by_property("final_topic").equal(topic_filter))
         
         combined_filter = (
             filters[0]
@@ -212,15 +219,16 @@ def search_posts_hybrid(
             alpha=alpha,
             limit=limit,
             filters=combined_filter,
-            query_properties=["post_content", "post_title", "topic_name"],
+            query_properties=["post_content", "post_title", "final_topic"],
             return_metadata=MetadataQuery(score=True) if include_scores else None,
             return_properties=[
                 "post_number",
                 "post_title",
                 "post_content",
-                "topic_name",
+                "final_topic",
+                "topic_confidence",
                 "post_date",
-                "all_topic_names",
+                "secondary_topics",
             ],
         )
         
@@ -230,9 +238,10 @@ def search_posts_hybrid(
                 "post_number": obj.properties.get("post_number"),
                 "title": obj.properties.get("post_title"),
                 "content": obj.properties.get("post_content", "")[:300] + "...",
-                "topic": obj.properties.get("topic_name"),
+                "primary_topic": obj.properties.get("final_topic"),
+                "topic_confidence": obj.properties.get("topic_confidence"),
                 "date": _format_date(obj.properties.get("post_date")),
-                "all_topics": obj.properties.get("all_topic_names"),
+                "secondary_topics": obj.properties.get("secondary_topics"),
             }
             
             if include_scores and hasattr(obj.metadata, "score"):
@@ -287,7 +296,7 @@ def search_by_date_range(
         ) & Filter.by_property("post_date").less_or_equal(end_iso)
         
         if topic_filter:
-            date_filter = date_filter & Filter.by_property("topic_name").equal(
+            date_filter = date_filter & Filter.by_property("final_topic").equal(
                 topic_filter
             )
         
@@ -298,31 +307,30 @@ def search_by_date_range(
                 "post_number",
                 "post_title",
                 "post_date",
-                "topic_name",
+                "final_topic",
+                "topic_confidence",
                 "post_content",
+                "secondary_topics",
             ],
         )
         
-        temp_results = []
+        formatted_results = []
         for obj in results.objects:
-            raw_date = obj.properties.get("post_date")
-            temp_results.append({
-                "data": {
-                    "post_number": obj.properties.get("post_number"),
-                    "title": obj.properties.get("post_title"),
-                    "date": _format_date(raw_date),
-                    "topic": obj.properties.get("topic_name"),
-                    "preview": obj.properties.get("post_content", "")[:150] + "...",
-                },
-                "sort_key": raw_date or "",
+            formatted_results.append({
+                "post_number": obj.properties.get("post_number"),
+                "title": obj.properties.get("post_title"),
+                "date": _format_date(obj.properties.get("post_date")),
+                "primary_topic": obj.properties.get("final_topic"),
+                "topic_confidence": obj.properties.get("topic_confidence"),
+                "preview": obj.properties.get("post_content", "")[:150] + "...",
+                "secondary_topics": obj.properties.get("secondary_topics"),
             })
         
+        # Sort by post_number
         if sort_order == "desc":
-            temp_results.sort(key=lambda x: x["sort_key"], reverse=True)
+            formatted_results.sort(key=lambda x: x["post_number"], reverse=True)
         else:
-            temp_results.sort(key=lambda x: x["sort_key"])
-        
-        formatted_results = [item["data"] for item in temp_results]
+            formatted_results.sort(key=lambda x: x["post_number"])
         
         return {
             "success": True,
@@ -359,15 +367,16 @@ def get_post_by_id(post_number: int) -> Dict[str, Any]:
                 "post_title",
                 "post_content",
                 "post_date",
-                "topic_name",
-                "all_topic_names",
-                "secondary_topic_names",
-                "secondary_topic_similarities",
+                "final_topic",
+                "topic_confidence",
+                "secondary_topics",
+                "sentence_level_explanation",
+                "word_level_explanation",
             ],
         )
         
         if not results.objects:
-            return {"success": False, "error": f"Post {post_number} not found"}
+            return {"success": False, "error": f"Post #{post_number} not found"}
         
         obj = results.objects[0]
         
@@ -378,12 +387,11 @@ def get_post_by_id(post_number: int) -> Dict[str, Any]:
                 "title": obj.properties.get("post_title"),
                 "content": obj.properties.get("post_content"),
                 "date": _format_date(obj.properties.get("post_date")),
-                "primary_topic": obj.properties.get("topic_name"),
-                "all_topics": obj.properties.get("all_topic_names"),
-                "secondary_topics": obj.properties.get("secondary_topic_names"),
-                "topic_similarities": obj.properties.get(
-                    "secondary_topic_similarities"
-                ),
+                "primary_topic": obj.properties.get("final_topic"),
+                "topic_confidence": obj.properties.get("topic_confidence"),
+                "secondary_topics": obj.properties.get("secondary_topics"),
+                "sentence_level_explanation": obj.properties.get("sentence_level_explanation"),
+                "word_level_explanation": obj.properties.get("word_level_explanation"),
             },
         }
         
@@ -408,7 +416,10 @@ def get_posts_batch(
     try:
         post_collection = client.collections.get("Post")
         
-        properties_list = ["post_number", "post_title", "post_date", "topic_name"]
+        properties_list = [
+            "post_number", "post_title", "post_date", "final_topic",
+            "topic_confidence", "secondary_topics"
+        ]
         if include_content:
             properties_list.append("post_content")
         
@@ -428,7 +439,9 @@ def get_posts_batch(
                 "post_number": post_id,
                 "title": obj.properties.get("post_title"),
                 "date": _format_date(obj.properties.get("post_date")),
-                "topic": obj.properties.get("topic_name"),
+                "primary_topic": obj.properties.get("final_topic"),
+                "topic_confidence": obj.properties.get("topic_confidence"),
+                "secondary_topics": obj.properties.get("secondary_topics"),
             }
             
             if include_content and "post_content" in obj.properties:
@@ -473,89 +486,83 @@ def search_posts_by_topic(
         if fuzzy:
             all_posts = post_collection.query.fetch_objects(
                 limit=5000,
-                return_properties=["post_topic", "topic_name", "topic_keywords"],
+                return_properties=["final_topic", "secondary_topics"],
             )
-            
-            matching_topic_ids, matched_topic_names = set(), set()
+            matching_topics, matched_topic_names = set(), set()
             search_lower = topic_name.lower()
             
             for post in all_posts.objects:
-                topic_id, tname, tkeywords = (
-                    post.properties.get("post_topic"),
-                    post.properties.get("topic_name", ""),
-                    post.properties.get("topic_keywords", ""),
-                )
+                final_topic = post.properties.get("final_topic", "") or ""
+                secondary_topics = post.properties.get("secondary_topics", "") or ""
                 
-                if search_lower in tname.lower() or search_lower in tkeywords.lower():
-                    matching_topic_ids.add(topic_id)
-                    matched_topic_names.add(tname)
+                if (search_lower in final_topic.lower() or 
+                    search_lower in secondary_topics.lower()):
+                    matching_topics.add(final_topic)
+                    matched_topic_names.add(final_topic)
             
-            if not matching_topic_ids:
+            if not matching_topics:
                 return {"success": False, "error": "No matching topics found"}
             
-            filter_prop = "all_topic_ids" if include_secondary else "post_topic"
+            if include_secondary:
+                filters = None
+                for topic in matching_topics:
+                    topic_filter = (
+                        Filter.by_property("final_topic").equal(topic) |
+                        Filter.by_property("secondary_topics").like(topic)
+                    )
+                    filters = topic_filter if filters is None else (filters | topic_filter)
+            else:
+                filters = None
+                for topic in matching_topics:
+                    topic_filter = Filter.by_property("final_topic").equal(topic)
+                    filters = topic_filter if filters is None else (filters | topic_filter)
             
             results = post_collection.query.fetch_objects(
-                filters=Filter.by_property(filter_prop).contains_any(
-                    list(matching_topic_ids)
-                ),
+                filters=filters,
                 limit=limit,
                 return_properties=[
-                    "post_number",
-                    "post_title",
-                    "post_date",
-                    "topic_name",
-                    "post_content",
-                    "all_topic_ids",
+                    "post_number", "post_title", "post_date", "final_topic",
+                    "topic_confidence", "post_content", "secondary_topics",
                 ],
             )
-            
             matched_topics_list = list(matched_topic_names)
         else:
             if include_secondary:
                 results = post_collection.query.bm25(
                     query=topic_name,
-                    query_properties=["topic_name", "all_topic_names"],
+                    query_properties=["final_topic", "secondary_topics"],
                     limit=limit,
                     return_properties=[
-                        "post_number",
-                        "post_title",
-                        "post_date",
-                        "topic_name",
-                        "post_content",
-                        "all_topic_ids",
+                        "post_number", "post_title", "post_date", "final_topic",
+                        "topic_confidence", "post_content", "secondary_topics",
                     ],
                 )
             else:
                 results = post_collection.query.fetch_objects(
-                    filters=Filter.by_property("topic_name").equal(topic_name),
+                    filters=Filter.by_property("final_topic").equal(topic_name),
                     limit=limit,
                     return_properties=[
-                        "post_number",
-                        "post_title",
-                        "post_date",
-                        "topic_name",
-                        "post_content",
+                        "post_number", "post_title", "post_date", "final_topic",
+                        "topic_confidence", "post_content", "secondary_topics",
                     ],
                 )
-            
             matched_topics_list = [topic_name]
-        
+
         formatted_results = []
         for obj in results.objects:
             result_data = {
                 "post_number": obj.properties.get("post_number"),
                 "title": obj.properties.get("post_title"),
                 "date": _format_date(obj.properties.get("post_date")),
-                "topic": obj.properties.get("topic_name"),
+                "primary_topic": obj.properties.get("final_topic"),
+                "topic_confidence": obj.properties.get("topic_confidence"),
                 "preview": obj.properties.get("post_content", "")[:150] + "...",
+                "secondary_topics": obj.properties.get("secondary_topics"),
             }
-            
             if include_secondary:
                 result_data["is_secondary"] = (
-                    obj.properties.get("topic_name") != topic_name
+                    obj.properties.get("final_topic") != topic_name
                 )
-            
             formatted_results.append(result_data)
         
         response = {
@@ -595,72 +602,57 @@ def get_topic_statistics(
         all_posts = post_collection.query.fetch_objects(
             limit=10000,
             return_properties=[
-                "post_topic",
-                "topic_name",
-                "secondary_topic_names",
-                "all_topic_ids",
+                "final_topic", "topic_confidence", "secondary_topics",
             ],
         )
         
-        topic_counts, topic_name_to_ids = defaultdict(int), defaultdict(set)
-        multilabel_count, topic_count_distribution = 0, defaultdict(int)
-        
+        topic_counts = defaultdict(int)
+        multi_label_count = 0
+        topic_count_distribution = defaultdict(int)
+
         for item in all_posts.objects:
-            topic_id, topic_name = (
-                item.properties.get("post_topic"),
-                item.properties.get("topic_name", "Unknown"),
-            )
-            
-            if topic_id is not None and topic_name:
+            topic_name = item.properties.get("final_topic", "Unknown")
+            if topic_name:
                 topic_counts[topic_name] += 1
-                topic_name_to_ids[topic_name].add(topic_id)
             
-            if item.properties.get("secondary_topic_names"):
-                multilabel_count += 1
+            if item.properties.get("secondary_topics"):
+                multi_label_count += 1
             
             if include_distribution:
-                all_topic_ids = item.properties.get("all_topic_ids")
-                num_topics = len(all_topic_ids) if all_topic_ids else (1 if topic_id else 0)
-                topic_count_distribution[
-                    f"{num_topics}_topics" if num_topics != 1 
-                    else "1_topic" if num_topics <= 4 
-                    else "4+_topics"
-                ] += 1
-        
-        sorted_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[
-            :top_n
-        ]
+                secondary_topics = item.properties.get("secondary_topics", "")
+                num_topics = 1 + (len(secondary_topics.split(",")) if secondary_topics else 0)
+                topic_label = (
+                    f"{num_topics}_topic{'s' if num_topics != 1 else ''}"
+                    if num_topics < 4 else "4+_topics"
+                )
+                topic_count_distribution[topic_label] += 1
+
+        sorted_topics = sorted(
+            topic_counts.items(), key=lambda x: x[1], reverse=True
+        )[:top_n]
         
         total_posts_count = len(all_posts.objects)
-        
         topic_breakdown = [
             {
                 "topic_name": name,
                 "post_count": count,
-                "percentage": round(count / total_posts_count * 100, 2)
-                if total_posts_count > 0
-                else 0,
-                "cluster_count": len(topic_name_to_ids[name]),
+                "percentage": round((count / total_posts_count) * 100, 2)
+                if total_posts_count > 0 else 0,
             }
             for name, count in sorted_topics
         ]
-        
+
         response = {
             "success": True,
             "statistics": {
                 "total_posts": total_posts_count,
                 "unique_topics": len(topic_counts),
-                "multilabel_posts": multilabel_count,
-                "multilabel_percentage": round(
-                    multilabel_count / total_posts_count * 100, 2
-                )
-                if total_posts_count > 0
-                else 0,
-                "avg_posts_per_topic": round(
-                    total_posts_count / len(topic_counts), 2
-                )
-                if topic_counts
-                else 0,
+                "multi_label_posts": multi_label_count,
+                "multi_label_percentage": round(
+                    (multi_label_count / total_posts_count) * 100, 2
+                ) if total_posts_count > 0 else 0,
+                "avg_posts_per_topic": round(total_posts_count / len(topic_counts), 2)
+                if topic_counts else 0,
             },
             "top_topics": topic_breakdown,
         }
@@ -695,34 +687,25 @@ def find_similar_posts(
             filters=Filter.by_property("post_number").equal(post_number),
             limit=1,
             return_properties=[
-                "post_number",
-                "post_title",
-                "topic_name",
-                "avg_embedding",
+                "post_number", "post_title", "final_topic",
+                "topic_confidence", "avg_embedding",
             ],
         )
-        
         if not reference.objects:
-            return {"success": False, "error": f"Reference post {post_number} not found"}
+            return {"success": False, "error": f"Reference post #{post_number} not found"}
         
         ref_obj = reference.objects[0]
         ref_embedding = ref_obj.properties.get("avg_embedding")
-        
         if not ref_embedding:
-            return {
-                "success": False,
-                "error": f"Post {post_number} has no embedding available",
-            }
-        
+            return {"success": False, "error": f"Post #{post_number} has no embedding"}
+
         similar = post_collection.query.near_vector(
             near_vector=ref_embedding,
             limit=limit + 1,
             return_metadata=MetadataQuery(distance=True),
             return_properties=[
-                "post_number",
-                "post_title",
-                "topic_name",
-                "post_content",
+                "post_number", "post_title", "final_topic",
+                "topic_confidence", "post_content",
             ],
         )
         
@@ -730,16 +713,15 @@ def find_similar_posts(
         for obj in similar.objects:
             if obj.properties.get("post_number") == post_number:
                 continue
-            
             similarity = (
                 1 - obj.metadata.distance if hasattr(obj.metadata, "distance") else 0
             )
-            
             if similarity >= min_similarity:
                 similar_posts.append({
                     "post_number": obj.properties.get("post_number"),
                     "title": obj.properties.get("post_title"),
-                    "topic": obj.properties.get("topic_name"),
+                    "primary_topic": obj.properties.get("final_topic"),
+                    "topic_confidence": obj.properties.get("topic_confidence"),
                     "similarity_score": round(similarity, 4),
                     "preview": obj.properties.get("post_content", "")[:150] + "...",
                 })
@@ -749,7 +731,8 @@ def find_similar_posts(
             "reference_post": {
                 "post_number": ref_obj.properties.get("post_number"),
                 "title": ref_obj.properties.get("post_title"),
-                "topic": ref_obj.properties.get("topic_name"),
+                "primary_topic": ref_obj.properties.get("final_topic"),
+                "topic_confidence": ref_obj.properties.get("topic_confidence"),
             },
             "similar_posts": similar_posts[:limit],
         }
@@ -784,42 +767,40 @@ def search_by_keyword(
         field_map = {
             "content": "post_content",
             "title": "post_title",
-            "topic": "topic_name",
+            "topic": "final_topic",
         }
-        
         query_properties = [
             field_map[field] for field in search_in if field in field_map
         ]
-        
+
         results = post_collection.query.bm25(
             query=keyword,
             query_properties=query_properties,
             limit=limit,
             return_properties=[
-                "post_number",
-                "post_title",
-                "post_content",
-                "topic_name",
-                "post_date",
+                "post_number", "post_title", "post_content",
+                "final_topic", "topic_confidence", "post_date",
             ],
         )
-        
+
         formatted_results = []
         for obj in results.objects:
             content = obj.properties.get("post_content", "")
             match_idx = content.lower().find(keyword.lower())
             match_context = (
-                "..."
-                + content[max(0, match_idx - 50) : min(len(content), match_idx + len(keyword) + 50)]
-                + "..."
+                "..." + content[
+                    max(0, match_idx - 50): min(
+                        len(content), match_idx + len(keyword) + 50
+                    )
+                ] + "..."
                 if match_idx != -1
                 else content[:150] + "..."
             )
-            
             formatted_results.append({
                 "post_number": obj.properties.get("post_number"),
                 "title": obj.properties.get("post_title"),
-                "topic": obj.properties.get("topic_name"),
+                "primary_topic": obj.properties.get("final_topic"),
+                "topic_confidence": obj.properties.get("topic_confidence"),
                 "date": _format_date(obj.properties.get("post_date")),
                 "preview": content[:200] + "...",
                 "match_context": match_context,
@@ -853,39 +834,31 @@ def list_all_topics(sort_by: str = "count", min_posts: int = 1) -> Dict[str, Any
         post_collection = client.collections.get("Post")
         
         all_posts = post_collection.query.fetch_objects(
-            limit=10000, return_properties=["post_topic", "topic_name"]
+            limit=10000, return_properties=["final_topic"]
         )
-        
-        topic_counts, topic_name_to_ids = defaultdict(int), defaultdict(set)
-        
+        topic_counts = defaultdict(int)
+
         for item in all_posts.objects:
-            topic_id, topic_name = (
-                item.properties.get("post_topic"),
-                item.properties.get("topic_name", "Unknown"),
-            )
-            if topic_id is not None and topic_name:
+            topic_name = item.properties.get("final_topic", "Unknown")
+            if topic_name:
                 topic_counts[topic_name] += 1
-                topic_name_to_ids[topic_name].add(topic_id)
-        
+
         filtered_topics = [
-            (name, count) for name, count in topic_counts.items() if count >= min_posts
+            (name, count) for name, count in topic_counts.items()
+            if count >= min_posts
         ]
-        
         filtered_topics.sort(
             key=lambda x: x[0] if sort_by == "name" else x[1],
             reverse=(sort_by == "count"),
         )
-        
+
         total_posts = len(all_posts.objects)
-        
         topic_list = [
             {
                 "topic_name": name,
                 "post_count": count,
-                "percentage": round(count / total_posts * 100, 2)
-                if total_posts > 0
-                else 0,
-                "cluster_count": len(topic_name_to_ids[name]),
+                "percentage": round((count / total_posts) * 100, 2)
+                if total_posts > 0 else 0,
             }
             for name, count in filtered_topics
         ]
@@ -903,73 +876,76 @@ def list_all_topics(sort_by: str = "count", min_posts: int = 1) -> Dict[str, Any
 # =============================
 
 def get_recent_posts(
-    days: int = 30, limit: int = 20, topic_filter: Optional[str] = None
+    days: Optional[int] = None, 
+    limit: int = 20, 
+    topic_filter: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Get the most recently published posts within a specified number of days.
-    Shows how many days ago each post was published.
-    Optional topic filter available."""
+    """Get the most recently published posts."""
     
     client = get_weaviate_client()
     try:
         post_collection = client.collections.get("Post")
         
-        threshold_date = (
-            (datetime.now() - timedelta(days=days))
-            .replace(hour=0, minute=0, second=0)
-            .isoformat()
-            + "Z"
-        )
+        # Build filters
+        combined_filter = None
         
-        date_filter = Filter.by_property("post_date").greater_or_equal(threshold_date)
+        if days is not None:
+            threshold_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            threshold_iso = threshold_date + "T00:00:00Z"
+            combined_filter = Filter.by_property("post_date").greater_or_equal(threshold_iso)
         
         if topic_filter:
-            date_filter = date_filter & Filter.by_property("topic_name").equal(
-                topic_filter
-            )
+            topic_filter_obj = Filter.by_property("final_topic").equal(topic_filter)
+            if combined_filter is not None:
+                combined_filter = combined_filter & topic_filter_obj
+            else:
+                combined_filter = topic_filter_obj
         
-        results = post_collection.query.fetch_objects(
-            filters=date_filter,
-            limit=limit,
-            return_properties=[
-                "post_number",
-                "post_title",
-                "post_date",
-                "topic_name",
-                "post_content",
+        # Build query kwargs
+        query_kwargs = {
+            "limit": limit,
+            "return_properties": [
+                "post_number", "post_title", "post_date", "final_topic",
+                "topic_confidence", "post_content", "secondary_topics",
             ],
-        )
+            "sort": Sort.by_property(name="post_number", ascending=False),
+        }
         
+        if combined_filter is not None:
+            query_kwargs["filters"] = combined_filter
+        
+        results = post_collection.query.fetch_objects(**query_kwargs)
         formatted_results = []
         now = datetime.now()
         
         for obj in results.objects:
-            post_date_iso = obj.properties.get("post_date")
-            post_date_formatted = _format_date(post_date_iso)
-            days_ago = None
+            props = obj.properties or {}
+            post_date_iso = props.get("post_date")
             
+            days_ago = None
             if post_date_iso:
                 try:
-                    post_date = datetime.fromisoformat(
-                        post_date_iso.replace("Z", "+00:00")
-                    )
+                    post_date = datetime.fromisoformat(post_date_iso.replace("Z", "+00:00"))
                     days_ago = (now - post_date.replace(tzinfo=None)).days
-                except:
-                    days_ago = None
+                except Exception:
+                    pass
             
             formatted_results.append({
-                "post_number": obj.properties.get("post_number"),
-                "title": obj.properties.get("post_title"),
-                "date": post_date_formatted,
-                "topic": obj.properties.get("topic_name"),
-                "preview": obj.properties.get("post_content", "")[:150] + "...",
+                "post_number": props.get("post_number"),
+                "title": props.get("post_title"),
+                "date": post_date_iso,
+                "primary_topic": props.get("final_topic"),
+                "topic_confidence": props.get("topic_confidence"),
+                "preview": (props.get("post_content") or "")[:150] + "...",
+                "secondary_topics": props.get("secondary_topics"),
                 "days_ago": days_ago,
             })
         
-        formatted_results.sort(key=lambda x: x["date"] or "", reverse=True)
+        period_str = "All time" if days is None else f"Last {days} days"
         
         return {
             "success": True,
-            "period": f"Last {days} days",
+            "period": period_str,
             "total_results": len(formatted_results),
             "topic_filter": topic_filter,
             "results": formatted_results,
@@ -1011,16 +987,15 @@ def aggregate_posts(
             ) & Filter.by_property("post_date").less_or_equal(end_iso)
         
         results = post_collection.query.fetch_objects(
-            filters=filters, limit=10000, return_properties=["topic_name", "post_date"]
+            filters=filters, limit=10000,
+            return_properties=["final_topic", "post_date"]
         )
-        
+
         aggregations = defaultdict(int)
-        
         for obj in results.objects:
             key = "Unknown"
-            
             if group_by == "topic":
-                key = obj.properties.get("topic_name", "Unknown")
+                key = obj.properties.get("final_topic", "Unknown")
             elif group_by in ["month", "year"]:
                 date_iso = obj.properties.get("post_date")
                 if date_iso:
@@ -1111,7 +1086,7 @@ def search_chunks(
                 "post_number": props.get("post_number"),
                 "post_title": props.get("post_title"),
                 "chunk_number": props.get("chunk_number"),
-                "chunk_text": props.get("chunk_text"),
+                "chunk_text": props.get("chunk_text")[:300] + "...",
                 "topic": props.get("chunk_topic"),
             })
         
@@ -1129,7 +1104,113 @@ def search_chunks(
             client.close()
 
 # =============================
-# MCP TOOL 13: CREATE DYNAMIC TOOL
+# MCP TOOL 13: GET POSTS FOR DAILY
+# =============================
+
+def get_posts_for_daily(topic: str) -> Dict[str, Any]:
+    """Fetch recent posts on a topic with current style guide."""
+    try:
+        posts_result = search_posts_by_topic(
+            topic_name=topic,
+            limit=10,
+            fuzzy=True,
+            include_secondary=False
+        )
+        
+        posts = posts_result.get("results", []) if posts_result.get("success") else []
+        posts_exist = len(posts) > 0
+        
+        style_guide = ""
+        if os.path.exists(STYLE_GUIDE_PATH):
+            with open(STYLE_GUIDE_PATH, "r") as f:
+                style_guide = f.read()
+        else:
+            style_guide = (
+                "Style guide not found. Create it with Sanjay Sahay's writing style:\n"
+                "- ALL CAPS titles as bold statements\n"
+                "- Short philosophical paragraphs\n"
+                "- Title repeated for emphasis\n"
+                "- Concise, impactful language\n"
+                "- Sign with author name\n"
+                "- 100-150 words typically"
+            )
+        
+        return {
+            "success": True,
+            "topic": topic,
+            "posts_count": len(posts),
+            "posts": posts,
+            "posts_exist": posts_exist,
+            "style_guide": style_guide,
+            "min_posts_for_pattern": MIN_POSTS_FOR_PATTERN,
+            "message": (
+                f"Fetched {len(posts)} existing posts on '{topic}'. "
+                "Use these to check for redundancy. Generate new post using style guide."
+            ),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "topic": topic}
+
+# =============================
+# MCP TOOL 14: ADD WRITING PATTERN
+# =============================
+
+def add_writing_pattern(pattern_description: str) -> Dict[str, Any]:
+    """Add new writing pattern to style guide if not already present."""
+    try:
+        current_guide = ""
+        if os.path.exists(STYLE_GUIDE_PATH):
+            with open(STYLE_GUIDE_PATH, "r") as f:
+                current_guide = f.read()
+        
+        if pattern_description.lower() in current_guide.lower():
+            return {
+                "success": False,
+                "message": "Pattern already exists in style guide or very similar",
+            }
+        
+        if "## DISCOVERED PATTERNS" in current_guide:
+            updated_guide = current_guide.replace(
+                "## DISCOVERED PATTERNS",
+                f"## DISCOVERED PATTERNS\n- {pattern_description}",
+            )
+        else:
+            updated_guide = (
+                current_guide + f"\n\n## DISCOVERED PATTERNS\n- {pattern_description}\n"
+            )
+        
+        with open(STYLE_GUIDE_PATH, "w") as f:
+            f.write(updated_guide)
+        
+        return {
+            "success": True,
+            "message": f"✓ Pattern added: {pattern_description}",
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# =============================
+# MCP TOOL 15: GET STYLE GUIDE
+# =============================
+
+def get_style_guide() -> Dict[str, Any]:
+    """Get current style guide content."""
+    try:
+        if os.path.exists(STYLE_GUIDE_PATH):
+            with open(STYLE_GUIDE_PATH, "r") as f:
+                style_guide = f.read()
+            return {"success": True, "style_guide": style_guide}
+        else:
+            return {
+                "success": False,
+                "message": f"Style guide not found at {STYLE_GUIDE_PATH}",
+                "style_guide": "",
+            }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# =============================
+# MCP TOOL 16: CREATE DYNAMIC TOOL
 # =============================
 
 def create_dynamic_tool(
@@ -1208,7 +1289,7 @@ def create_dynamic_tool(
     return result
 
 # =============================
-# MCP TOOL 14: LIST DYNAMIC TOOLS
+# MCP TOOL 17: LIST DYNAMIC TOOLS
 # =============================
 
 def list_dynamic_tools() -> Dict[str, Any]:
@@ -1229,6 +1310,7 @@ def list_dynamic_tools() -> Dict[str, Any]:
         "get_posts_batch", "search_posts_by_topic", "get_topic_statistics",
         "find_similar_posts", "search_by_keyword", "list_all_topics",
         "get_recent_posts", "aggregate_posts", "search_chunks",
+        "get_posts_for_daily", "add_writing_pattern", "get_style_guide",
         "create_dynamic_tool", "list_dynamic_tools",
     ]
     
@@ -1246,7 +1328,7 @@ def list_dynamic_tools() -> Dict[str, Any]:
     return result
 
 # =============================
-# MCP TOOL 15-19: CRUD & ADMIN
+# MCP TOOL 18-22: CRUD & ADMIN
 # =============================
 
 def insert_object(class_name: str, properties: dict) -> dict:
