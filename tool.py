@@ -9,6 +9,7 @@ import uuid
 import sys
 import time
 import os
+import threading
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -37,6 +38,12 @@ MODEL_DIMENSION = 768
 _model_load_attempted = False
 _weaviate_client = None
 _weaviate_connection_tested = False
+_weaviate_last_healthcheck = 0.0
+# Health check / retry configuration
+_WEAVIATE_HEALTHCHECK_INTERVAL_SECONDS = 300  # 5 minutes
+_WEAVIATE_MAX_RETRIES = 3
+_WEAVIATE_RETRY_BACKOFF_SECONDS = 2.0
+_weaviate_client_lock = threading.Lock()
 
 def json_safe_default(obj):
     """Custom JSON serializer for objects not serializable by default."""
@@ -110,16 +117,8 @@ def get_embedding_for_query(text: str) -> List[float]:
     vector = model.encode(text)
     return vector.tolist()
 
-def get_weaviate_client():
-    """Initialize and return Weaviate client (lazy connection to cloud)"""
-    global _weaviate_client, _weaviate_connection_tested
-    
-    # Test connection only on first call
-    if not _weaviate_connection_tested:
-        _weaviate_connection_tested = True
-        print("🔌 Connecting to Weaviate Cloud...", file=sys.stderr)
-    
-    # Get cloud credentials from environment
+def _create_weaviate_client():
+    """Create a new Weaviate client instance using environment credentials."""
     wcd_url = os.getenv("WEAVIATE_URL")
     wcd_api_key = os.getenv("WEAVIATE_API_KEY")
     
@@ -129,8 +128,8 @@ def get_weaviate_client():
             "Check your Cloud Run environment variables."
         )
     
-    # Connect to Weaviate Cloud with proper timeouts
-    return weaviate.connect_to_weaviate_cloud(
+    print("🔌 (Re)connecting to Weaviate Cloud...", file=sys.stderr)
+    client = weaviate.connect_to_weaviate_cloud(
         cluster_url=wcd_url,
         auth_credentials=weaviate.auth.AuthApiKey(wcd_api_key),
         skip_init_checks=True,
@@ -142,6 +141,76 @@ def get_weaviate_client():
             )
         )
     )
+    return client
+
+
+def _is_client_alive(client) -> bool:
+    """Check whether the existing Weaviate client connection is still healthy."""
+    try:
+        client.is_ready()
+        return True
+    except Exception as exc:
+        print(f"⚠️ Detected stale Weaviate connection: {exc}", file=sys.stderr)
+        return False
+
+
+def _connect_with_retries(max_attempts: int = _WEAVIATE_MAX_RETRIES):
+    """Attempt to create a Weaviate client with retries and exponential backoff."""
+    last_error = None
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            client = _create_weaviate_client()
+            client.is_ready()
+            print("✅ Weaviate connection established.", file=sys.stderr)
+            return client
+        except Exception as exc:
+            last_error = exc
+            print(
+                f"❌ Weaviate connection attempt {attempt}/{max_attempts} failed: {exc}",
+                file=sys.stderr,
+            )
+            if attempt < max_attempts:
+                print(f"⏳ Retrying in {delay:.1f}s...", file=sys.stderr)
+                time.sleep(delay)
+                delay *= _WEAVIATE_RETRY_BACKOFF_SECONDS
+    raise RuntimeError(
+        f"Unable to connect to Weaviate after {max_attempts} attempts: {last_error}"
+    )
+
+
+def _should_run_healthcheck() -> bool:
+    """Determine whether a healthcheck should run based on the last check timestamp."""
+    now = time.time()
+    return (now - _weaviate_last_healthcheck) >= _WEAVIATE_HEALTHCHECK_INTERVAL_SECONDS
+
+
+def get_weaviate_client():
+    """
+    Initialize and return a Weaviate client with connection validation and retries.
+    Ensures the connection is healthy before handing it to tools.
+    """
+    global _weaviate_client, _weaviate_connection_tested, _weaviate_last_healthcheck
+    
+    with _weaviate_client_lock:
+        if _weaviate_client is not None:
+            # Periodically validate the client is still alive
+            if _should_run_healthcheck():
+                if _is_client_alive(_weaviate_client):
+                    _weaviate_last_healthcheck = time.time()
+                    return _weaviate_client
+                else:
+                    _weaviate_client = None
+            else:
+                return _weaviate_client
+        
+        # Need to create a new client (either first time or after failure)
+        if not _weaviate_connection_tested:
+            _weaviate_connection_tested = True
+        
+        _weaviate_client = _connect_with_retries()
+        _weaviate_last_healthcheck = time.time()
+        return _weaviate_client
 
 def _format_date(date_input: Any) -> Optional[str]:
     """Safely converts a datetime object OR ISO date string to 'YYYY-MM-DD' format."""
