@@ -1,13 +1,8 @@
 # Core Logic & Direct Imports
 python-dotenv==1.1.0
 weaviate-client==4.17.0
-torch==2.9.0
 sentence-transformers==3.2.1
-langchain-groq==0.3.8
-langchain==0.3.27
-pandas==2.2.2
-numpy==1.26.4
-bertopic==0.17.3
+
 
 #fastmcp download
 fastmcp>=2.0.0
