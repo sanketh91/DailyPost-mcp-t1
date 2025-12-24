@@ -27,7 +27,7 @@ RUN mkdir -p /app/.cache && \
 
 # ============================================================================
 
-COPY mcpserver.py .
+COPY mcp_server.py .
 COPY tool.py .
 COPY dynamictoolsframework.py .
 COPY dynamictoolregistry.py .
@@ -39,5 +39,5 @@ RUN mkdir -p /app/dynamictools_storage
 ENV PYTHONUNBUFFERED=1
 # Cloud Run expects the app to listen on PORT
 
-CMD ["python", "mcpserver.py"]
+CMD ["python", "mcp_server.py"]
 # Start the server
