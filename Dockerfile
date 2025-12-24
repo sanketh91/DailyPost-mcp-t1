@@ -29,8 +29,8 @@ RUN mkdir -p /app/.cache && \
 
 COPY mcp_server.py .
 COPY tool.py .
-COPY dynamictoolsframework.py .
-COPY dynamictoolregistry.py .
+COPY dynamic_tools_framework.py .
+COPY dynamic_tool_registry.py .
 # Copy all Python files
 
 RUN mkdir -p /app/dynamictools_storage
