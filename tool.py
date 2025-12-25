@@ -905,6 +905,14 @@ def search_posts_by_topic(
 
 def get_topic_statistics(top_n: int = 15, include_distribution: bool = True) -> Dict[str, Any]:
     request_id = str(uuid.uuid4())
+    # Entry log to confirm FastMCP actually invoked this tool
+    log_event(
+        "INFO",
+        "Tool entered",
+        request_id=request_id,
+        tool="get_topic_statistics",
+        raw_args={"top_n": top_n, "include_distribution": include_distribution},
+    )
     try:
         top_n = max(1, min(int(top_n), 100))
 
@@ -964,6 +972,14 @@ def get_topic_statistics(top_n: int = 15, include_distribution: bool = True) -> 
 
 def find_similar_posts(post_number: int, limit: int = 5, min_similarity: float = 0.7) -> Dict[str, Any]:
     request_id = str(uuid.uuid4())
+    # Entry log to confirm FastMCP actually invoked this tool
+    log_event(
+        "INFO",
+        "Tool entered",
+        request_id=request_id,
+        tool="find_similar_posts",
+        raw_args={"post_number": post_number, "limit": limit, "min_similarity": min_similarity},
+    )
     try:
         pn = int(post_number)
         limit = _clamp_limit(limit)
