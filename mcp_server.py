@@ -20,11 +20,11 @@ if __name__ == "__main__":
     is_cloud = os.getenv("PORT") or os.getenv("K_SERVICE")
 
     if is_cloud:
-        print(f"🚀 Starting MCP Server (HTTP) on 0.0.0.0:{port}...", file=sys.stderr)
-        # Run with HTTP (streamable) transport for remote / Cloud Run access
-        # Endpoint will be: http://0.0.0.0:{port}/mcp
+        print(f"🚀 Starting MCP Server (Streamable HTTP) on 0.0.0.0:{port}...", file=sys.stderr)
+        # Streamable HTTP transport - required for mcp-remote + Cloud Run
+        # Creates /mcp (POST) + /mcp/sse (streaming)
         mcp.run(
-            transport="http",
+            transport="streamable-http",  # ✅ Critical change
             host="0.0.0.0",
             port=port,
             path="/mcp",
@@ -32,5 +32,4 @@ if __name__ == "__main__":
         )
     else:
         print("🚀 Starting MCP Server in STDIO mode (local)...", file=sys.stderr)
-        # Default stdio transport for local Claude/Desktop integration
         mcp.run()
