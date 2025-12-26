@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps (changes → ONLY this layer rebuilds)
+WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -14,14 +15,7 @@ FROM deps AS model-cache
 RUN pip install sentence-transformers torch
 ENV TRANSFORMERS_CACHE=/app.cache
 RUN mkdir -p /app.cache && \
-    python -c "
-import os
-from sentence_transformers import SentenceTransformer
-print('Downloading sentence-transformers model...')
-model = SentenceTransformer('all-mpnet-base-v2')
-model.save_pretrained('/app.cache/all-mpnet-base-v2')
-print('Model cached:', model.get_sentence_embedding_dimension(), 'dimensions')
-"
+    python -c "from sentence_transformers import SentenceTransformer; import os; print('Downloading sentence-transformers model...'); model = SentenceTransformer('all-mpnet-base-v2'); model.save_pretrained('/app.cache/all-mpnet-base-v2'); print('Model cached:', model.get_sentence_embedding_dimension(), 'dimensions')"
 
 # STAGE 3: Runtime (ONLY your code rebuilds on changes)
 FROM python:3.11-slim AS runtime
