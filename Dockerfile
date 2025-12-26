@@ -32,8 +32,8 @@ COPY --from=model-cache /app.cache /app.cache
 WORKDIR /app
 COPY mcp_server.py .
 COPY tool.py .
-COPY dynamictoolsframework.py .
-COPY dynamictoolregistry.py .
+COPY dynamic_tools_framework.py .
+COPY dynamic_tool_registry.py .
 RUN mkdir -p app/dynamictoolsstorage
 
 # Runtime config
