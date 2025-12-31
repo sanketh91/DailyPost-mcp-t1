@@ -987,11 +987,8 @@ def find_similar_posts(post_number: int, limit: int = 5, min_similarity: float =
 
         def _op(client):
             post_collection = client.collections.get(CFG.POST_COLLECTION)
-            ref = post_collection.query.fetch_objects(
-                filters=Filter.by_property("post_number").equal(pn),
-                limit=1,
-                return_properties=["post_number", "post_title", "final_topic", "topic_confidence", "avg_embedding"],
-            )
+            query_opts = {"filters": Filter.by_property("post_number").equal(pn), "limit": 1, "return_properties": ["post_number", "post_title", "final_topic", "topic_confidence"], "include_vector": True}
+            ref = post_collection.query.fetch_objects(**query_opts)
             return post_collection, ref
 
         post_collection, ref = weaviate_call("find_similar_posts.ref", request_id=request_id, fn=_op)
@@ -1000,9 +997,11 @@ def find_similar_posts(post_number: int, limit: int = 5, min_similarity: float =
 
         ref_obj = ref.objects[0]
         ref_props = ref_obj.properties or {}
-        ref_embedding = ref_props.get("avg_embedding")
+        # V4 client: vector is attribute of object, not in properties
+        ref_embedding = ref_obj.vector.get("default") if isinstance(ref_obj.vector, dict) else ref_obj.vector
+        
         if not ref_embedding:
-            return {"success": False, "error": f"Post #{pn} has no embedding"}
+             return {"success": False, "error": f"Post #{pn} has no embedding"}
 
         def _op2(client):
             pc = client.collections.get(CFG.POST_COLLECTION)
@@ -1249,23 +1248,27 @@ def search_chunks(query: str, limit: int = 10, post_title: Optional[str] = None)
 
         def _op(client):
             chunk_collection = client.collections.get(CFG.CHUNK_COLLECTION)
-            filters = Filter.by_property("post_title").equal(post_title) if post_title else None
+            # Check if post_title is in schema before filtering (it is not in current schema)
+            # filters = Filter.by_property("post_title").equal(post_title) if post_title else None
+            # Schema inspection shows Chunk has: [post_number, chunk_number, chunk_text]
+            # No post_title or chunk_topic.
+            filters = None
 
             # If embedding unavailable, fallback to BM25 on chunk_text
             if query_vector is None:
                 return chunk_collection.query.bm25(
                     query=query,
-                    query_properties=["chunk_text", "post_title"],
+                    query_properties=["chunk_text"],
                     limit=limit,
                     filters=filters,
-                    return_properties=["post_number", "post_title", "chunk_number", "chunk_text", "chunk_topic"],
+                    return_properties=["post_number", "chunk_number", "chunk_text"],
                 )
 
             return chunk_collection.query.near_vector(
                 near_vector=query_vector,
                 limit=limit,
                 filters=filters,
-                return_properties=["post_number", "post_title", "chunk_number", "chunk_text", "chunk_topic"],
+                return_properties=["post_number", "chunk_number", "chunk_text"],
             )
 
         results = weaviate_call("search_chunks", request_id=request_id, fn=_op)
@@ -1275,10 +1278,10 @@ def search_chunks(query: str, limit: int = 10, post_title: Optional[str] = None)
             p = obj.properties or {}
             formatted.append({
                 "post_number": p.get("post_number"),
-                "post_title": p.get("post_title"),
+                # "post_title": p.get("post_title"), # not in schema
                 "chunk_number": p.get("chunk_number"),
                 "chunk_text": (p.get("chunk_text") or "")[:300] + "...",
-                "topic": p.get("chunk_topic"),
+                # "topic": p.get("chunk_topic"), # not in schema
             })
 
         formatted = _dedupe_results(formatted, key="chunk_number")
