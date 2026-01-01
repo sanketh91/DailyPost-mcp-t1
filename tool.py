@@ -535,7 +535,13 @@ def search_posts_hybrid(
     end_date: Optional[str] = None,
     topic_filter: Optional[str] = None,
     include_scores: bool = True,
+    apply_score_filter: bool = True,
+    min_score: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """
+    Hybrid search combining semantic and keyword matching.
+    Alpha controls the balance: 0.0=pure keyword, 1.0=pure vector, 0.7=favors semantic.
+    """
     request_id = str(uuid.uuid4())
     t0 = _now_s()
     try:
@@ -570,11 +576,16 @@ def search_posts_hybrid(
                 for f in filters_list[1:]:
                     combined_filter = combined_filter & f
 
-            # If embedding unavailable, use BM25 keyword search as graceful degradation
+            # If embedding unavailable, use BM25 keyword search as fallback
             if query_vector is None:
+                log_event(
+                    "WARNING",
+                    "Embedding unavailable, using BM25",
+                    request_id=request_id,
+                )
                 return post_collection.query.bm25(
                     query=query,
-                    query_properties=["post_content", "post_title", "final_topic"],
+                    query_properties=["post_content", "post_title"],
                     limit=limit,
                     filters=combined_filter,
                     return_properties=[
@@ -590,7 +601,7 @@ def search_posts_hybrid(
                 alpha=alpha,
                 limit=limit,
                 filters=combined_filter,
-                query_properties=["post_content", "post_title", "final_topic"],
+                query_properties=["post_content", "post_title"],
                 return_metadata=MetadataQuery(score=True) if include_scores else None,
                 return_properties=[
                     "post_number", "post_title", "post_content", "final_topic", "topic_confidence",
@@ -617,7 +628,12 @@ def search_posts_hybrid(
             formatted.append(item)
 
         formatted = _dedupe_results(formatted, key="post_number")
-        formatted = _apply_dynamic_score_filter(formatted)
+        
+        # Apply score filtering
+        if min_score is not None:
+            formatted = [item for item in formatted if item.get("relevance_score", 0) >= min_score]
+        elif apply_score_filter:
+            formatted = _apply_dynamic_score_filter(formatted)
 
         log_event(
             "INFO",
@@ -626,6 +642,8 @@ def search_posts_hybrid(
             tool="search_posts_hybrid",
             query_hash=_sha(query.lower()),
             total_results=len(formatted),
+            alpha=alpha,
+            embedding_used=query_vector is not None,
             total_ms=int((_now_s() - t0) * 1000),
             embedding_cache=_EMB_CACHE.stats(),
         )
