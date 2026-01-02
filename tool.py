@@ -674,6 +674,9 @@ def search_by_date_range(
     topic_filter: Optional[str] = None,
     sort_order: str = "desc",
 ) -> Dict[str, Any]:
+    """
+    Fetches posts whose post_date falls within a given start/end date range, optionally filtered by final topic, returning sorted metadata and short content previews.
+    """
     request_id = str(uuid.uuid4())
     t0 = _now_s()
     try:
@@ -725,6 +728,9 @@ def search_by_date_range(
 
 
 def get_post_by_id(post_number: int) -> Dict[str, Any]:
+    """
+    Retrieve a single post by post_number with full content, topic metadata (primary topic, confidence score, secondary topics), and all available metadata. Fast single-post lookup.
+    """
     request_id = str(uuid.uuid4())
     try:
         pn = int(post_number)
@@ -767,6 +773,9 @@ def get_post_by_id(post_number: int) -> Dict[str, Any]:
 
 
 def get_posts_batch(post_numbers: List[int], include_content: bool = True) -> Dict[str, Any]:
+    """
+    Retrieves multiple posts in one call by a list of post_number values, with optional inclusion of full content and an explicit list of any missing IDs.
+    """
     request_id = str(uuid.uuid4())
     try:
         if not isinstance(post_numbers, list) or not post_numbers:
@@ -818,6 +827,9 @@ def search_posts_by_topic(
     fuzzy: bool = True,
     include_secondary: bool = False,
 ) -> Dict[str, Any]:
+    """
+    Finds posts matching a topic string using fuzzy or exact matching over final_topic and optionally secondary_topics , returning de‑duplicated posts and, for fuzzy mode, the set of matched topic names
+    """
     request_id = str(uuid.uuid4())
     try:
         topic_name = _validate_query(topic_name)
@@ -922,6 +934,9 @@ def search_posts_by_topic(
 
 
 def get_topic_statistics(top_n: int = 15, include_distribution: bool = True) -> Dict[str, Any]:
+    """
+    Analyze topic distribution across posts including: unique topic counts, top N topics (default 15) with counts/percentages, and optional distribution analysis showing how many topics are tagged per post.
+    """
     request_id = str(uuid.uuid4())
     # Entry log to confirm FastMCP actually invoked this tool
     log_event(
@@ -989,6 +1004,9 @@ def get_topic_statistics(top_n: int = 15, include_distribution: bool = True) -> 
 
 
 def find_similar_posts(post_number: int, limit: int = 5, min_similarity: float = 0.7) -> Dict[str, Any]:
+    """
+    Given a reference post_number , uses its stored vector to run a near_vector search and return the most similar posts with similarity scores, excluding the reference itself.
+    """
     request_id = str(uuid.uuid4())
     # Entry log to confirm FastMCP actually invoked this tool
     log_event(
@@ -1071,6 +1089,9 @@ def search_by_keyword(
     limit: int = 10,
     exact_match: bool = False,
 ) -> Dict[str, Any]:
+    """
+    Runs a pure BM25 keyword search over selected fields (content, title, topic), returning de‑duplicated hits with previews and a short match context snippet around the first occurrence of the keyword.
+    """
     request_id = str(uuid.uuid4())
     try:
         keyword = _validate_query(keyword)
@@ -1121,6 +1142,9 @@ def search_by_keyword(
 
 
 def list_all_topics(sort_by: str = "count", min_posts: int = 1) -> Dict[str, Any]:
+    """
+    Scans all posts to build a frequency table of final_topic values, then returns topics meeting a minimum post threshold sorted by count or name, including per‑topic percentages.
+    """
     request_id = str(uuid.uuid4())
     try:
         min_posts = max(1, int(min_posts))
@@ -1150,6 +1174,9 @@ def list_all_topics(sort_by: str = "count", min_posts: int = 1) -> Dict[str, Any
 
 
 def get_recent_posts(days: Optional[int] = None, limit: int = 20, topic_filter: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Get the most recent posts (default 20, configurable via limit), optionally filtered to a time window in days and/or specific topic. Results include "days_ago" field and content previews, sorted by date.
+    """
     request_id = str(uuid.uuid4())
     try:
         limit = _clamp_limit(limit)
@@ -1212,6 +1239,9 @@ def get_recent_posts(days: Optional[int] = None, limit: int = 20, topic_filter: 
 
 
 def aggregate_posts(group_by: str = "topic", date_range: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """
+    Aggregates posts by final_topic , month, or year (based on post_date ), with an optional date range filter, returning grouped counts and percentages for each bucket.
+    """
     request_id = str(uuid.uuid4())
     try:
         if group_by not in ("topic", "month", "year"):
@@ -1257,6 +1287,9 @@ def aggregate_posts(group_by: str = "topic", date_range: Optional[Dict[str, str]
 
 
 def search_chunks(query: str, limit: int = 10, post_title: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Performs semantic or BM25 search over the Chunk collection’s chunk_text , returning matching chunks with post_number , chunk_number , and truncated text, and falling back to BM25 if embeddings are unavailable.
+    """
     request_id = str(uuid.uuid4())
     try:
         query = _validate_query(query)
@@ -1310,6 +1343,9 @@ def search_chunks(query: str, limit: int = 10, post_title: Optional[str] = None)
 
 
 def get_posts_for_daily(topic: str) -> Dict[str, Any]:
+    """
+    Fetch up to 10 curated posts for a given topic along with the current style guide and content generation parameters. Used for daily content curation and generation
+    """
     request_id = str(uuid.uuid4())
     try:
         topic = _validate_query(topic)
@@ -1347,6 +1383,9 @@ def get_posts_for_daily(topic: str) -> Dict[str, Any]:
 
 
 def add_writing_pattern(pattern_description: str) -> Dict[str, Any]:
+    """
+    Appends a new discovered writing pattern to the style‑guide file under the ## DISCOVERED PATTERNS section, preventing duplicates based on case‑insensitive text matching.
+    """
     request_id = str(uuid.uuid4())
     try:
         pattern_description = _validate_query(pattern_description)
@@ -1373,6 +1412,9 @@ def add_writing_pattern(pattern_description: str) -> Dict[str, Any]:
 
 
 def get_style_guide() -> Dict[str, Any]:
+    """
+    Reads and returns the full contents of the configured style‑guide file if it exists, otherwise reports that the style guide is missing
+    """
     request_id = str(uuid.uuid4())
     try:
         if os.path.exists(CFG.STYLE_GUIDE_PATH):
@@ -1389,6 +1431,9 @@ def get_style_guide() -> Dict[str, Any]:
 # ============================================================
 
 def create_dynamic_tool(query_description: str, tool_name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Create and register a custom tool at runtime based on a query description. The tool becomes immediately callable and wired into the system registry. Useful for building specialized search or analysis tools.
+    """
     request_id = str(uuid.uuid4())
     try:
         query_description = _validate_query(query_description)
@@ -1443,6 +1488,9 @@ def create_dynamic_tool(query_description: str, tool_name: Optional[str] = None)
 
 
 def list_dynamic_tools() -> Dict[str, Any]:
+    """
+    List all dynamically created tools in the registry, showing which have active handlers and warning about any persisted tools missing from the registry. Useful for tool management and debugging.
+    """
     request_id = str(uuid.uuid4())
     try:
         registry = get_dynamic_registry()
@@ -1468,6 +1516,9 @@ def list_dynamic_tools() -> Dict[str, Any]:
 # ============================================================
 
 def insert_object(class_name: str, properties: dict) -> dict:
+    """
+    Inserts a new object into a specified Weaviate class with validated, non‑empty properties, returning the created object UUID.
+    """
     request_id = str(uuid.uuid4())
     try:
         class_name = _validate_query(class_name)
@@ -1487,6 +1538,9 @@ def insert_object(class_name: str, properties: dict) -> dict:
 
 
 def update_object(class_name: str, object_id: str, properties: dict) -> dict:
+    """
+    Updates properties of an existing object identified by UUID in a specified class, requiring a non‑empty properties dict and returning success metadata.
+    """
     request_id = str(uuid.uuid4())
     try:
         class_name = _validate_query(class_name)
@@ -1507,6 +1561,9 @@ def update_object(class_name: str, object_id: str, properties: dict) -> dict:
 
 
 def delete_object(class_name: str, object_id: str) -> dict:
+    """
+    Deletes an object by UUID from a specified Weaviate class using the shared client, returning the class name and deleted ID on success.
+    """
     request_id = str(uuid.uuid4())
     try:
         class_name = _validate_query(class_name)
@@ -1525,6 +1582,9 @@ def delete_object(class_name: str, object_id: str) -> dict:
 
 
 def backup_weaviate(backup_id: Optional[str] = None, backend: str = "s3") -> Dict[str, Any]:
+    """
+    Triggers a Weaviate backup for the Post and Chunk collections to the configured backend (S3 or filesystem), generating a backup ID if omitted and returning the raw backup result.
+    """
     request_id = str(uuid.uuid4())
     try:
         backup_id = backup_id or f"backup-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
@@ -1547,6 +1607,9 @@ def backup_weaviate(backup_id: Optional[str] = None, backend: str = "s3") -> Dic
 
 
 def restore_backup(backup_id: str, backend: str = "s3") -> Dict[str, Any]:
+    """
+    Restore Post and Chunk collections from a previous backup using backup ID and backend (S3 or filesystem, default S3). WARNING: Overwrites current data. Returns restore status and confirmation.
+    """
     request_id = str(uuid.uuid4())
     try:
         backup_id = _validate_query(backup_id)
@@ -1569,7 +1632,7 @@ def restore_backup(backup_id: str, backend: str = "s3") -> Dict[str, Any]:
 
 def export_all_data(limit: int = 10000) -> Dict[str, Any]:
     """
-    Export Post and Chunk data (capped) for debugging / offline inspection.
+    Exports up to a configurable limit of Post and Chunk objects for debugging or offline inspection, returning normalized lists of IDs and properties from both collections.
     """
     request_id = str(uuid.uuid4())
     try:
