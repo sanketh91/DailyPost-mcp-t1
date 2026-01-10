@@ -34,11 +34,6 @@ from weaviate.classes.query import Filter, MetadataQuery, Sort
 from weaviate.classes.backup import BackupStorage
 from sentence_transformers import SentenceTransformer
 
-# Import dynamic tool framework
-from dynamic_tool_registry import get_dynamic_registry
-from dynamic_tools_framework import DynamicToolGenerator
-
-
 # ============================================================
 # Config
 # ============================================================
@@ -84,10 +79,6 @@ class Config:
     # Collections
     POST_COLLECTION: str = os.getenv("POST_COLLECTION", "Post")
     CHUNK_COLLECTION: str = os.getenv("CHUNK_COLLECTION", "Chunk")
-
-    # Misc
-    STYLE_GUIDE_PATH: str = os.getenv("STYLE_GUIDE_PATH", "./sanjay_sahay_style.txt")
-    MIN_POSTS_FOR_PATTERN: int = int(os.getenv("MIN_POSTS_FOR_PATTERN", "5"))
 
 
 CFG = Config()
@@ -510,16 +501,6 @@ def register_tools():
     mcp.tool()(get_recent_posts)
     mcp.tool()(aggregate_posts)
     mcp.tool()(search_chunks)
-    mcp.tool()(create_dynamic_tool)
-    mcp.tool()(list_dynamic_tools)
-    mcp.tool()(insert_object)
-    mcp.tool()(update_object)
-    mcp.tool()(delete_object)
-    mcp.tool()(backup_weaviate)
-    mcp.tool()(restore_backup)
-    mcp.tool()(export_all_data)
-    mcp.tool()(get_posts_for_daily)
-    mcp.tool()(add_writing_pattern)
     mcp.tool()(get_style_guide)
 
 
@@ -535,136 +516,105 @@ def search_posts_hybrid(
     end_date: Optional[str] = None,
     topic_filter: Optional[str] = None,
     include_scores: bool = True,
-    apply_score_filter: bool = True,
-    min_score: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Hybrid search combining semantic and keyword matching.
     Alpha controls the balance: 0.0=pure keyword, 1.0=pure vector, 0.7=favors semantic.
     """
-    request_id = str(uuid.uuid4())
-    t0 = _now_s()
+    request_id = f"hybrid_search_{int(time.time() * 1000)}"
+    client = get_weaviate_client(request_id)
+    
     try:
-        query = _validate_query(query)
-        limit = _clamp_limit(limit)
+        try:
+            query_vector = get_embedding_for_query(query)
+            embedding_used = True
+        except Exception as e:
+            logger.warning(f"Failed to generate query vector, falling back to keyword-only: {e}")
+            query_vector = None
+            embedding_used = False
 
-        # Embedding (may return None -> fallback)
-        query_vector = EMBEDDINGS.embed(query, request_id=request_id)
+        post_collection = client.collections.get("Post")
+        filters = []
+        
+        if start_date and end_date:
+            start_dt = _parse_date_input(start_date).replace(hour=0, minute=0, second=0)
+            end_dt = _parse_date_input(end_date).replace(hour=23, minute=59, second=59)
+            start_iso = start_dt.isoformat() + "Z"
+            end_iso = end_dt.isoformat() + "Z"
+            filters.append(
+                Filter.by_property("post_date").greater_or_equal(start_iso)
+                & Filter.by_property("post_date").less_or_equal(end_iso)
+            )
 
-        def _op(client):
-            post_collection = client.collections.get(CFG.POST_COLLECTION)
+        if topic_filter:
+            filters.append(Filter.by_property("final_topic").equal(topic_filter))
 
-            filters_list = []
-            if start_date and end_date:
-                start_dt = _parse_date_input(start_date).replace(hour=0, minute=0, second=0)
-                end_dt = _parse_date_input(end_date).replace(hour=23, minute=59, second=59)
-                start_iso = start_dt.isoformat() + "Z"
-                end_iso = end_dt.isoformat() + "Z"
-                filters_list.append(
-                    Filter.by_property("post_date").greater_or_equal(start_iso)
-                    & Filter.by_property("post_date").less_or_equal(end_iso)
-                )
+        combined_filter = (
+            filters[0] if len(filters) == 1 
+            else (filters[0] & filters[1] if len(filters) == 2 else None)
+        )
 
-            if topic_filter:
-                filters_list.append(Filter.by_property("final_topic").equal(topic_filter))
-
-            combined_filter = None
-            if len(filters_list) == 1:
-                combined_filter = filters_list[0]
-            elif len(filters_list) >= 2:
-                combined_filter = filters_list[0]
-                for f in filters_list[1:]:
-                    combined_filter = combined_filter & f
-
-            # If embedding unavailable, use BM25 keyword search as fallback
-            if query_vector is None:
-                log_event(
-                    "WARNING",
-                    "Embedding unavailable, using BM25",
-                    request_id=request_id,
-                )
-                return post_collection.query.bm25(
-                    query=query,
-                    query_properties=["post_content", "post_title"],
-                    limit=limit,
-                    filters=combined_filter,
-                    return_properties=[
-                        "post_number", "post_title", "post_content", "final_topic", "topic_confidence",
-                        "post_date", "secondary_topics",
-                    ],
-                    return_metadata=MetadataQuery(score=True) if include_scores else None,
-                )
-
-            return post_collection.query.hybrid(
+        # Use hybrid search if we have embeddings, otherwise fall back to keyword search
+        if query_vector is not None:
+            results = post_collection.query.hybrid(
                 query=query,
                 vector=query_vector,
                 alpha=alpha,
                 limit=limit,
                 filters=combined_filter,
-                query_properties=["post_content", "post_title"],
+                query_properties=["post_content", "post_title", "final_topic"],
                 return_metadata=MetadataQuery(score=True) if include_scores else None,
                 return_properties=[
-                    "post_number", "post_title", "post_content", "final_topic", "topic_confidence",
-                    "post_date", "secondary_topics",
+                    "post_number", "post_title", "post_content", "final_topic",
+                    "topic_confidence", "post_date", "secondary_topics",
+                ],
+            )
+        else:
+            # Fallback to BM25 keyword search
+            results = post_collection.query.bm25(
+                query=query,
+                limit=limit,
+                filters=combined_filter,
+                query_properties=["post_content", "post_title", "final_topic"],
+                return_metadata=MetadataQuery(score=True) if include_scores else None,
+                return_properties=[
+                    "post_number", "post_title", "post_content", "final_topic",
+                    "topic_confidence", "post_date", "secondary_topics",
                 ],
             )
 
-        results = weaviate_call("search_posts_hybrid", request_id=request_id, fn=_op)
-
-        formatted = []
+        formatted_results = []
         for obj in results.objects:
-            props = obj.properties or {}
-            item = {
-                "post_number": props.get("post_number"),
-                "title": props.get("post_title"),
-                "content": (props.get("post_content") or "")[:300] + "...",
-                "primary_topic": props.get("final_topic"),
-                "topic_confidence": props.get("topic_confidence"),
-                "date": _format_date(props.get("post_date")),
-                "secondary_topics": props.get("secondary_topics"),
+            result = {
+                "post_number": obj.properties.get("post_number"),
+                "title": obj.properties.get("post_title"),
+                "content": obj.properties.get("post_content", "")[:300] + "...",
+                "primary_topic": obj.properties.get("final_topic"),
+                "topic_confidence": obj.properties.get("topic_confidence"),
+                "date": _format_date(obj.properties.get("post_date")),
+                "secondary_topics": obj.properties.get("secondary_topics"),
             }
-            if include_scores and hasattr(obj, "metadata") and hasattr(obj.metadata, "score"):
-                item["relevance_score"] = obj.metadata.score
-            formatted.append(item)
-
-        formatted = _dedupe_results(formatted, key="post_number")
-        
-        # Apply score filtering
-        if min_score is not None:
-            formatted = [item for item in formatted if item.get("relevance_score", 0) >= min_score]
-        elif apply_score_filter:
-            formatted = _apply_dynamic_score_filter(formatted)
-
-        log_event(
-            "INFO",
-            "Tool ok",
-            request_id=request_id,
-            tool="search_posts_hybrid",
-            query_hash=_sha(query.lower()),
-            total_results=len(formatted),
-            alpha=alpha,
-            embedding_used=query_vector is not None,
-            total_ms=int((_now_s() - t0) * 1000),
-            embedding_cache=_EMB_CACHE.stats(),
-        )
+            if include_scores and hasattr(obj.metadata, "score"):
+                result["relevance_score"] = obj.metadata.score
+            formatted_results.append(result)
 
         return {
             "success": True,
             "query": query,
-            "total_results": len(formatted),
+            "total_results": len(formatted_results),
             "search_params": {
-                "alpha": alpha,
-                "limit": limit,
-                "filters_applied": bool(start_date and end_date) or bool(topic_filter),
-                "embedding_used": query_vector is not None,
+                "alpha": alpha, 
+                "limit": limit, 
+                "filters_applied": bool(filters),
+                "embedding_used": embedding_used
             },
-            "results": formatted,
+            "results": formatted_results,
         }
-    except ToolTimeout as e:
-        return {"success": False, "error": str(e), "query": query}
     except Exception as e:
-        log_event("ERROR", "Tool error", request_id=request_id, tool="search_posts_hybrid", error=str(e))
         return {"success": False, "error": str(e), "query": query}
+    finally:
+        if client:
+            client.close()
 
 
 def search_by_date_range(
@@ -1341,323 +1291,50 @@ def search_chunks(query: str, limit: int = 10, post_title: Optional[str] = None)
         log_event("ERROR", "Tool error", request_id=request_id, tool="search_chunks", error=str(e))
         return {"success": False, "error": str(e), "query": query}
 
+def get_style_guide(refresh_context: bool = False) -> str:
+    """
+    Retrieves the Sanjay Sahay DailyPost writing style guide using a Hybrid Approach.
+    """
+    # --- PATH FIX START ---
+    # Get the directory where THIS script is located
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    # Join it with the filename to get a full, absolute path
+    STYLE_GUIDE_PATH = os.path.join(current_dir, "sanjay_sahay_style.txt")
+    # --- PATH FIX END ---
 
-def get_posts_for_daily(topic: str) -> Dict[str, Any]:
-    """
-    Fetch up to 10 curated posts for a given topic along with the current style guide and content generation parameters. Used for daily content curation and generation
-    """
     request_id = str(uuid.uuid4())
-    try:
-        topic = _validate_query(topic)
-        posts_result = search_posts_by_topic(topic_name=topic, limit=10, fuzzy=True, include_secondary=False)
-        posts = posts_result.get("results", []) if posts_result.get("success") else []
+    
+    # Setup minimal logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("sanjay_style_tool")
 
-        style_guide = ""
-        if os.path.exists(CFG.STYLE_GUIDE_PATH):
-            with open(CFG.STYLE_GUIDE_PATH, "r", encoding="utf-8") as f:
-                style_guide = f.read()
+    try:
+        # 1. Base Layer: Read the static file
+        base_content = ""
+        if os.path.exists(STYLE_GUIDE_PATH):
+            with open(STYLE_GUIDE_PATH, "r", encoding="utf-8") as f:
+                base_content = f.read()
         else:
-            style_guide = (
-                "Style guide not found. Create it with Sanjay Sahay's writing style:\n"
-                "- ALL CAPS titles as bold statements\n"
-                "- Short philosophical paragraphs\n"
-                "- Title repeated for emphasis\n"
-                "- Concise, impactful language\n"
-                "- Sign with author name\n"
-                "- 100-150 words typically"
-            )
+            # Returns the absolute path in the error so you can debug exactly where it looked
+            return f"Error: Style guide file not found at {STYLE_GUIDE_PATH}"
 
-        return {
-            "success": True,
-            "topic": topic,
-            "posts_count": len(posts),
-            "posts": posts,
-            "posts_exist": len(posts) > 0,
-            "style_guide": style_guide,
-            "min_posts_for_pattern": CFG.MIN_POSTS_FOR_PATTERN,
-            "message": f"Fetched {len(posts)} existing posts on '{topic}'. Use these to check for redundancy.",
-        }
+        # 2. Hybrid Layer: Optional Dynamic Refresh
+        dynamic_content = ""
+        if refresh_context:
+            try:
+                logger.info(f"Request {request_id}: Refreshing context...")
+                # Placeholder logic
+                dynamic_content = "\n\n[DYNAMIC UPDATE]: Recent trends show a focus on 'AI Ethics'."
+            except Exception as e:
+                logger.warning(f"Refresh failed: {e}")
+                dynamic_content = "\n\n[WARNING]: Could not fetch updates."
+
+        return base_content + dynamic_content
+
     except Exception as e:
-        log_event("ERROR", "Tool error", request_id=request_id, tool="get_posts_for_daily", error=str(e))
-        return {"success": False, "error": str(e), "topic": topic}
-
-
-def add_writing_pattern(pattern_description: str) -> Dict[str, Any]:
-    """
-    Appends a new discovered writing pattern to the style‑guide file under the ## DISCOVERED PATTERNS section, preventing duplicates based on case‑insensitive text matching.
-    """
-    request_id = str(uuid.uuid4())
-    try:
-        pattern_description = _validate_query(pattern_description)
-        current = ""
-        if os.path.exists(CFG.STYLE_GUIDE_PATH):
-            with open(CFG.STYLE_GUIDE_PATH, "r", encoding="utf-8") as f:
-                current = f.read()
-
-        if pattern_description.lower() in current.lower():
-            return {"success": False, "message": "Pattern already exists in style guide or very similar"}
-
-        if "## DISCOVERED PATTERNS" in current:
-            updated = current.replace("## DISCOVERED PATTERNS", f"## DISCOVERED PATTERNS\n- {pattern_description}")
-        else:
-            updated = current + f"\n\n## DISCOVERED PATTERNS\n- {pattern_description}\n"
-
-        with open(CFG.STYLE_GUIDE_PATH, "w", encoding="utf-8") as f:
-            f.write(updated)
-
-        return {"success": True, "message": f"✓ Pattern added: {pattern_description}"}
-    except Exception as e:
-        log_event("ERROR", "Tool error", request_id=request_id, tool="add_writing_pattern", error=str(e))
-        return {"success": False, "error": str(e)}
-
-
-def get_style_guide() -> Dict[str, Any]:
-    """
-    Reads and returns the full contents of the configured style‑guide file if it exists, otherwise reports that the style guide is missing
-    """
-    request_id = str(uuid.uuid4())
-    try:
-        if os.path.exists(CFG.STYLE_GUIDE_PATH):
-            with open(CFG.STYLE_GUIDE_PATH, "r", encoding="utf-8") as f:
-                return {"success": True, "style_guide": f.read()}
-        return {"success": False, "message": f"Style guide not found at {CFG.STYLE_GUIDE_PATH}", "style_guide": ""}
-    except Exception as e:
-        log_event("ERROR", "Tool error", request_id=request_id, tool="get_style_guide", error=str(e))
-        return {"success": False, "error": str(e)}
-
-
-# ============================================================
-# Dynamic tools (kept compatible, but hardened)
-# ============================================================
-
-def create_dynamic_tool(query_description: str, tool_name: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Create and register a custom tool at runtime based on a query description. The tool becomes immediately callable and wired into the system registry. Useful for building specialized search or analysis tools.
-    """
-    request_id = str(uuid.uuid4())
-    try:
-        query_description = _validate_query(query_description)
-        generator = DynamicToolGenerator()
-        result = generator.create_and_register_tool(
-            query_description=query_description,
-            tool_name=tool_name,
-            parameters=[tool_name] if tool_name else None,
-        )
-
-        if result.get("success") and mcp is not None:
-            tool_name_created = result.get("tool_name")
-            if tool_name_created:
-                registry = get_dynamic_registry()
-                handler = registry.get_handler(tool_name_created)
-
-                tool_def = None
-                for dyn_tool in registry.get_tool_definitions():
-                    if dyn_tool.name == tool_name_created:
-                        tool_def = dyn_tool
-                        break
-
-                if handler and tool_def:
-                    async def tool_wrapper(**kwargs):
-                        out = await handler(kwargs)
-                        if isinstance(out, list) and out and hasattr(out[0], "text"):
-                            return json.loads(out[0].text)
-                        return out if isinstance(out, dict) else {"success": True, "result": out}
-
-                    tool_wrapper.__name__ = tool_name_created
-                    tool_wrapper.__doc__ = tool_def.description
-
-                    # Try FastMCP runtime registration if supported
-                    try:
-                        tool_manager = getattr(mcp, "_tool_manager", None) or getattr(mcp, "tool_manager", None) or getattr(mcp, "tools", None)
-                        if tool_manager and hasattr(tool_manager, "add_tool"):
-                            tool_manager.add_tool(tool_wrapper, name=tool_name_created, description=tool_def.description)
-                            result["registered_with_fastmcp"] = True
-                            result["note"] = f"Tool '{tool_name_created}' registered with FastMCP."
-                        else:
-                            result["registered_with_fastmcp"] = False
-                            result["note"] = "Tool registered in dynamic registry. FastMCP runtime registration not available."
-                    except Exception as e:
-                        result["registered_with_fastmcp"] = False
-                        result["registration_warning"] = str(e)
-                        result["note"] = "Tool created but runtime registration failed; dynamic registry handler still available."
-
-        return result
-    except Exception as e:
-        log_event("ERROR", "Tool error", request_id=request_id, tool="create_dynamic_tool", error=str(e))
-        return {"success": False, "error": str(e)}
-
-
-def list_dynamic_tools() -> Dict[str, Any]:
-    """
-    List all dynamically created tools in the registry, showing which have active handlers and warning about any persisted tools missing from the registry. Useful for tool management and debugging.
-    """
-    request_id = str(uuid.uuid4())
-    try:
-        registry = get_dynamic_registry()
-        result = registry.list_tools()
-
-        dynamic_tools = registry.get_tool_definitions()
-        dynamic_names = [t.name for t in dynamic_tools]
-        available_in_registry = [name for name in dynamic_names if registry.has_tool(name)]
-        not_in_registry = [name for name in dynamic_names if not registry.has_tool(name)]
-
-        result["tools_in_registry"] = available_in_registry
-        result["tools_not_in_registry"] = not_in_registry
-        if not_in_registry:
-            result["warning"] = f"Some dynamic tools {not_in_registry} are listed but not in registry."
-        return result
-    except Exception as e:
-        log_event("ERROR", "Tool error", request_id=request_id, tool="list_dynamic_tools", error=str(e))
-        return {"success": False, "error": str(e)}
-
-
-# ============================================================
-# CRUD & Admin (hardened; no per-call close)
-# ============================================================
-
-def insert_object(class_name: str, properties: dict) -> dict:
-    """
-    Inserts a new object into a specified Weaviate class with validated, non‑empty properties, returning the created object UUID.
-    """
-    request_id = str(uuid.uuid4())
-    try:
-        class_name = _validate_query(class_name)
-        if not isinstance(properties, dict) or not properties:
-            raise ValueError("properties must be a non-empty dict")
-
-        def _op(client):
-            coll = client.collections.get(class_name)
-            obj_uuid = coll.data.insert(properties)
-            return obj_uuid
-
-        obj_uuid = weaviate_call("insert_object", request_id=request_id, fn=_op)
-        return {"success": True, "class_name": class_name, "id": str(obj_uuid)}
-    except Exception as e:
-        log_event("ERROR", "Tool error", request_id=request_id, tool="insert_object", error=str(e))
-        return {"success": False, "error": str(e)}
-
-
-def update_object(class_name: str, object_id: str, properties: dict) -> dict:
-    """
-    Updates properties of an existing object identified by UUID in a specified class, requiring a non‑empty properties dict and returning success metadata.
-    """
-    request_id = str(uuid.uuid4())
-    try:
-        class_name = _validate_query(class_name)
-        object_id = _validate_query(object_id)
-        if not isinstance(properties, dict) or not properties:
-            raise ValueError("properties must be a non-empty dict")
-
-        def _op(client):
-            coll = client.collections.get(class_name)
-            coll.data.update(uuid.UUID(object_id), properties)
-            return True
-
-        weaviate_call("update_object", request_id=request_id, fn=_op)
-        return {"success": True, "class_name": class_name, "id": object_id}
-    except Exception as e:
-        log_event("ERROR", "Tool error", request_id=request_id, tool="update_object", error=str(e))
-        return {"success": False, "error": str(e)}
-
-
-def delete_object(class_name: str, object_id: str) -> dict:
-    """
-    Deletes an object by UUID from a specified Weaviate class using the shared client, returning the class name and deleted ID on success.
-    """
-    request_id = str(uuid.uuid4())
-    try:
-        class_name = _validate_query(class_name)
-        object_id = _validate_query(object_id)
-
-        def _op(client):
-            coll = client.collections.get(class_name)
-            coll.data.delete(uuid.UUID(object_id))
-            return True
-
-        weaviate_call("delete_object", request_id=request_id, fn=_op)
-        return {"success": True, "class_name": class_name, "id": object_id}
-    except Exception as e:
-        log_event("ERROR", "Tool error", request_id=request_id, tool="delete_object", error=str(e))
-        return {"success": False, "error": str(e)}
-
-
-def backup_weaviate(backup_id: Optional[str] = None, backend: str = "s3") -> Dict[str, Any]:
-    """
-    Triggers a Weaviate backup for the Post and Chunk collections to the configured backend (S3 or filesystem), generating a backup ID if omitted and returning the raw backup result.
-    """
-    request_id = str(uuid.uuid4())
-    try:
-        backup_id = backup_id or f"backup-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
-        backend = backend.lower()
-        storage = BackupStorage.S3 if backend == "s3" else BackupStorage.FILESYSTEM
-
-        def _op(client):
-            # V4/v3 clients may differ; keep minimal
-            return client.backup.create(
-                backup_id=backup_id,
-                backend=storage,
-                include_collections=[CFG.POST_COLLECTION, CFG.CHUNK_COLLECTION],
-            )
-
-        res = weaviate_call("backup_weaviate", request_id=request_id, fn=_op)
-        return {"success": True, "backup_id": backup_id, "backend": backend, "result": res}
-    except Exception as e:
-        log_event("ERROR", "Tool error", request_id=request_id, tool="backup_weaviate", error=str(e))
-        return {"success": False, "error": str(e)}
-
-
-def restore_backup(backup_id: str, backend: str = "s3") -> Dict[str, Any]:
-    """
-    Restore Post and Chunk collections from a previous backup using backup ID and backend (S3 or filesystem, default S3). WARNING: Overwrites current data. Returns restore status and confirmation.
-    """
-    request_id = str(uuid.uuid4())
-    try:
-        backup_id = _validate_query(backup_id)
-        backend = backend.lower()
-        storage = BackupStorage.S3 if backend == "s3" else BackupStorage.FILESYSTEM
-
-        def _op(client):
-            return client.backup.restore(
-                backup_id=backup_id,
-                backend=storage,
-                include_collections=[CFG.POST_COLLECTION, CFG.CHUNK_COLLECTION],
-            )
-
-        res = weaviate_call("restore_backup", request_id=request_id, fn=_op)
-        return {"success": True, "backup_id": backup_id, "backend": backend, "result": res}
-    except Exception as e:
-        log_event("ERROR", "Tool error", request_id=request_id, tool="restore_backup", error=str(e))
-        return {"success": False, "error": str(e)}
-
-
-def export_all_data(limit: int = 10000) -> Dict[str, Any]:
-    """
-    Exports up to a configurable limit of Post and Chunk objects for debugging or offline inspection, returning normalized lists of IDs and properties from both collections.
-    """
-    request_id = str(uuid.uuid4())
-    try:
-        limit = max(1, min(int(limit), 50000))
-
-        def _op(client):
-            post_collection = client.collections.get(CFG.POST_COLLECTION)
-            chunk_collection = client.collections.get(CFG.CHUNK_COLLECTION)
-            posts = post_collection.query.fetch_objects(limit=limit)
-            chunks = chunk_collection.query.fetch_objects(limit=limit)
-            return posts, chunks
-
-        posts, chunks = weaviate_call("export_all_data", request_id=request_id, fn=_op)
-
-        def _fmt(objs):
-            out = []
-            for o in objs.objects:
-                out.append({"id": str(getattr(o, "uuid", "")), "properties": o.properties or {}})
-            return out
-
-        return {"success": True, "posts": _fmt(posts), "chunks": _fmt(chunks), "limits": {"limit": limit}}
-    except Exception as e:
-        log_event("ERROR", "Tool error", request_id=request_id, tool="export_all_data", error=str(e))
-        return {"success": False, "error": str(e)}
-
+        logger.error(f"Error in get_style_guide: {e}")
+        return f"Error processing request: {str(e)}"
+    
 
 # ============================================================
 # Optional: controlled shutdown hook
