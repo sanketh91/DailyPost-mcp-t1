@@ -1371,7 +1371,7 @@ def _parse_date_to_rfc3339(date_str: str) -> str:
 
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+def _chunk_text(text: str, chunk_size: int = 700, overlap: int = 50) -> List[str]:
     """Split text into overlapping chunks"""
     if not text: 
         return []
