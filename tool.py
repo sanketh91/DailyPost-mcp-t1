@@ -502,7 +502,7 @@ def register_tools():
     mcp.tool()(aggregate_posts)
     mcp.tool()(search_chunks)
     mcp.tool()(get_style_guide)
-
+    mcp.tool()(vectorize_and_insert_post)
 
 # ============================================================
 # Tools
@@ -1334,7 +1334,183 @@ def get_style_guide(refresh_context: bool = False) -> str:
     except Exception as e:
         logger.error(f"Error in get_style_guide: {e}")
         return f"Error processing request: {str(e)}"
+
+# ============================================================
+# NEW TOOL: Vectorize & Insert (Helpers + Main Function)
+# ============================================================
+
+def _parse_date_to_rfc3339(date_str: str) -> str:
+    """
+    Ensures date is in Weaviate-compliant RFC3339 format.
+    Accepts: '2023-01-01', '2023/01/01', 'Jan 1 2023'.
+    Returns: '2023-01-01T00:00:00Z'
+    """
+    if not date_str:
+        # Default to now if missing to prevent error
+        return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+    # If it already looks like RFC3339 (has T and Z), trust it
+    if "T" in str(date_str) and "Z" in str(date_str):
+        return str(date_str)
+
+    try:
+        # Clean up string and try basic ISO parsing (YYYY-MM-DD)
+        clean_str = str(date_str).strip().split(" ")[0]
+        dt = datetime.strptime(clean_str, "%Y-%m-%d")
+    except ValueError:
+        try:
+            # Final fallback: Try pandas to_datetime if available, or just use now
+            # (Note: importing pandas locally to avoid dependency issues if not at top)
+            import pandas as pd
+            dt = pd.to_datetime(date_str).to_pydatetime()
+        except Exception:
+            # Absolute failsafe: Return today's date so the insert doesn't crash
+            log_event("WARNING", f"Date parsing failed for '{date_str}', using current date")
+            dt = datetime.utcnow()
+
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+    """Split text into overlapping chunks"""
+    if not text: 
+        return []
+    chunks = []
+    start = 0
+    text_len = len(text)
     
+    while start < text_len:
+        end = min(start + chunk_size, text_len)
+        chunks.append(text[start:end])
+        # Move forward, ensuring we don't get stuck if overlap >= chunk_size
+        step = max(1, chunk_size - overlap)
+        start += step
+        
+    return chunks
+
+def vectorize_and_insert_post(
+    post_number: int,
+    post_title: str,
+    post_content: str,
+    post_date: str,
+    final_topic: str,
+    topic_confidence: float,
+    secondary_topics: str = "",
+    sentence_level_explanation: str = "",
+    word_level_explanation: str = "",
+) -> Dict[str, Any]:
+    """
+    Vectorize a DailyPost (all fields combined) and insert into Weaviate.
+    Combines title, content, and all explanations into a single vector.
+    Strictly follows Post and Chunk schema (Weaviate v4).
+    Before assigning the topics, first use list_all_topics to verify they exist, and ONLY USE THOSE TOPICS FOR THE POSTS.
+    """
+    # Import UUID generator locally
+    from weaviate.util import generate_uuid5
+    
+    request_id = f"vectorize_insert_{int(time.time() * 1000)}"
+    t0 = _now_s()
+    
+    try:
+        # 1. Validate inputs
+        post_number = int(post_number)
+        topic_confidence = float(topic_confidence)
+        
+        # 2. Date Safety (Uses the helper defined ABOVE)
+        formatted_date = _parse_date_to_rfc3339(post_date)
+
+        # 3. Combine text for Post embedding
+        combined_text = (
+            f"{post_title} {post_content} {secondary_topics} "
+            f"{sentence_level_explanation} {word_level_explanation}"
+        ).strip()
+        
+        if not combined_text:
+            raise ValueError("All text fields are empty")
+        
+        # 4. Generate Post Embedding
+        post_vector = EMBEDDINGS.embed(combined_text, request_id=request_id)
+        if post_vector is None:
+            raise RuntimeError("Failed to generate embedding for post (model error)")
+        
+        # 5. Prepare Properties (EXCLUDING vector)
+        post_properties = {
+            "post_number": post_number,
+            "post_title": post_title,
+            "post_content": post_content,
+            "post_date": formatted_date,
+            "final_topic": final_topic,
+            "topic_confidence": topic_confidence,
+            "secondary_topics": secondary_topics,
+            "sentence_level_explanation": sentence_level_explanation,
+            "word_level_explanation": word_level_explanation,
+        }
+        
+        # 6. Insert Post (Vector passed separately)
+        def _insert_post(client):
+            post_collection = client.collections.get(CFG.POST_COLLECTION)
+            return post_collection.data.insert(
+                properties=post_properties, 
+                vector=post_vector
+            )
+        
+        post_id = weaviate_call("vectorize_insert.post", request_id=request_id, fn=_insert_post)
+        
+        # 7. Chunking Strategy
+        chunks = _chunk_text(post_content)
+        chunk_ids = []
+        
+        for chunk_num, chunk_text in enumerate(chunks):
+            # Embed the individual chunk
+            chunk_vector = EMBEDDINGS.embed(chunk_text, request_id=request_id)
+            if chunk_vector is None:
+                log_event("WARNING", "Chunk embedding failed", request_id=request_id, chunk_num=chunk_num)
+                continue
+            
+            chunk_properties = {
+                "post_number": post_number,
+                "chunk_number": chunk_num,
+                "chunk_text": chunk_text,
+            }
+            
+            # Deterministic UUID prevents duplicate chunks
+            chunk_uuid = generate_uuid5(f"{post_number}_{chunk_num}")
+            
+            def _insert_chunk(client):
+                chunk_collection = client.collections.get(CFG.CHUNK_COLLECTION)
+                return chunk_collection.data.insert(
+                    properties=chunk_properties,
+                    vector=chunk_vector,
+                    uuid=chunk_uuid
+                )
+            
+            chunk_id = weaviate_call(f"vectorize_insert.chunk.{chunk_num}", request_id=request_id, fn=_insert_chunk)
+            chunk_ids.append(chunk_id)
+        
+        log_event(
+            "INFO",
+            "Vectorize and insert completed",
+            request_id=request_id,
+            post_number=post_number,
+            chunks_created=len(chunk_ids),
+            total_ms=int((_now_s() - t0) * 1000),
+        )
+        
+        return {
+            "success": True,
+            "post_number": post_number,
+            "post_id": str(post_id),
+            "date_stored": formatted_date,
+            "chunks_created": len(chunk_ids),
+            "message": f"Successfully inserted post #{post_number} with {len(chunk_ids)} chunks",
+        }
+        
+    except Exception as e:
+        log_event("ERROR", "Vectorize insert failed", request_id=request_id, post_number=post_number, error=str(e))
+        return {
+            "success": False,
+            "error": str(e),
+            "post_number": post_number,
+        }
 
 # ============================================================
 # Optional: controlled shutdown hook
