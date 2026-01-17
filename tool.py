@@ -28,7 +28,9 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Callable, Tuple
 from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+import re
 
+import numpy as np
 import weaviate
 from weaviate.classes.query import Filter, MetadataQuery, Sort
 from weaviate.classes.backup import BackupStorage
@@ -1337,57 +1339,199 @@ def get_style_guide(refresh_context: bool = False) -> str:
         return f"Error processing request: {str(e)}"
 
 # ============================================================
-# NEW TOOL: Vectorize & Insert (Helpers + Main Function)
+# CONFIGURATION & CACHE
+# ============================================================
+
+_TOPIC_CACHE = {}
+
+# CORRECTED FALLBACK LIST (Matches your friend's classifier script)
+FALLBACK_TOPICS = [
+    "Politics & Governance",
+    "Cybersecurity & Digital Threats",
+    "Technology & Innovation",
+    "Artificial Intelligence and Data Science",
+    "Media, Communication & Public Discourse",
+    "Economy, Business & Finance",
+    "Healthcare, Biosecurity & Public Health",
+    "Law, Regulation & Compliance",
+    "Education, Work & Human Development",
+    "Ethics, Society & Public Life"
+]
+
+# ============================================================
+# HELPERS
 # ============================================================
 
 def _parse_date_to_rfc3339(date_str: str) -> str:
-    """
-    Ensures date is in Weaviate-compliant RFC3339 format.
-    Accepts: '2023-01-01', '2023/01/01', 'Jan 1 2023'.
-    Returns: '2023-01-01T00:00:00Z'
-    """
+    """Ensures date is in Weaviate-compliant RFC3339 format."""
     if not date_str:
-        # Default to now if missing to prevent error
         return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        
-    # If it already looks like RFC3339 (has T and Z), trust it
     if "T" in str(date_str) and "Z" in str(date_str):
         return str(date_str)
-
     try:
-        # Clean up string and try basic ISO parsing (YYYY-MM-DD)
         clean_str = str(date_str).strip().split(" ")[0]
         dt = datetime.strptime(clean_str, "%Y-%m-%d")
     except ValueError:
-        try:
-            # Final fallback: Try pandas to_datetime if available, or just use now
-            # (Note: importing pandas locally to avoid dependency issues if not at top)
-            import pandas as pd
-            dt = pd.to_datetime(date_str).to_pydatetime()
-        except Exception:
-            # Absolute failsafe: Return today's date so the insert doesn't crash
-            log_event("WARNING", f"Date parsing failed for '{date_str}', using current date")
-            dt = datetime.utcnow()
-
+        dt = datetime.utcnow()
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def _chunk_text(text: str, chunk_size: int = 700, overlap: int = 50) -> List[str]:
-    """Split text into overlapping chunks"""
-    if not text: 
-        return []
+def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+    """Split text into overlapping chunks."""
+    if not text: return []
     chunks = []
     start = 0
     text_len = len(text)
-    
     while start < text_len:
         end = min(start + chunk_size, text_len)
         chunks.append(text[start:end])
-        # Move forward, ensuring we don't get stuck if overlap >= chunk_size
         step = max(1, chunk_size - overlap)
         start += step
-        
     return chunks
 
+def cosine_similarity(v1, v2) -> float:
+    """Compute cosine similarity using NumPy."""
+    if v1 is None or v2 is None: return 0.0
+    dot_prod = np.dot(v1, v2)
+    norm_v1 = np.linalg.norm(v1)
+    norm_v2 = np.linalg.norm(v2)
+    if norm_v1 == 0 or norm_v2 == 0: return 0.0
+    return float(dot_prod / (norm_v1 * norm_v2))
+
+def _get_all_topic_vectors(client: Any, request_id: str) -> Dict[str, List[float]]:
+    """
+    Fetches topics from DB + FALLBACK list to ensure we always have 
+    comparison targets for the similarity math.
+    """
+    global _TOPIC_CACHE
+    
+    # 1. Start with known Fallback topics
+    all_topics = set(FALLBACK_TOPICS)
+
+    # 2. Try to fetch real topics from DB to expand the list
+    try:
+        post_collection = client.collections.get(CFG.POST_COLLECTION)
+        result = post_collection.aggregate.over_all(group_by="final_topic")
+        db_topics = [grp.grouped_by.value for grp in result.groups]
+        all_topics.update(db_topics)
+    except Exception:
+        pass # Fail silently, use fallback
+
+    # 3. Embed and Cache
+    current_vectors = {}
+    for t in all_topics:
+        if t in _TOPIC_CACHE:
+            current_vectors[t] = _TOPIC_CACHE[t]
+        else:
+            vec = EMBEDDINGS.embed(t, request_id=f"{request_id}_topic_embed")
+            if vec:
+                _TOPIC_CACHE[t] = vec
+                current_vectors[t] = vec
+            
+    return current_vectors
+
+def _generate_stats(content: str, post_vec: List[float], final_topic: str, request_id: str, client: Any) -> tuple:
+    """
+    Generates stats using the EXACT logic from the friend's script:
+    - Splits sentences by regex r'(?<=[.!?])\s+'
+    - Tokenizes words by regex r"\b\w+\b"
+    """
+    # 1. Get Comparison Vectors
+    topic_vectors = _get_all_topic_vectors(client, request_id)
+    if final_topic not in topic_vectors:
+        vec = EMBEDDINGS.embed(final_topic, request_id)
+        if vec: topic_vectors[final_topic] = vec
+
+    # ------------------------------------------------------------------
+    # A. SECONDARY TOPICS 
+    # ------------------------------------------------------------------
+    secondary_data = []
+    for t_name, t_vec in topic_vectors.items():
+        if t_name == final_topic: continue 
+        score = cosine_similarity(post_vec, t_vec)
+        if score >= 0.30: # Matching friend's SECONDARY_THRESHOLD
+            secondary_data.append((t_name, float(score))) # Tuple format
+            
+    secondary_data.sort(key=lambda x: x[1], reverse=True)
+    secondary_topics_json = json.dumps(secondary_data)
+
+    # ------------------------------------------------------------------
+    # B. SENTENCE LEVEL (Top 5)
+    # ------------------------------------------------------------------
+    # Regex split from friend's code
+    sentences = re.split(r'(?<=[.!?])\s+', content.strip())
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
+    
+    sentence_exp = []
+    if sentences:
+        for sent in sentences: # Process all valid sentences
+            sent_vec = EMBEDDINGS.embed(sent, request_id)
+            if not sent_vec: continue
+
+            # Compare sentence to ALL topics to find best match
+            best_t = final_topic
+            best_s = -1.0
+            
+            for t_name, t_vec in topic_vectors.items():
+                score = cosine_similarity(sent_vec, t_vec)
+                if score > best_s:
+                    best_s = score
+                    best_t = t_name
+            
+            sentence_exp.append({
+                "sentence": sent, 
+                "topic": best_t, 
+                "similarity": float(best_s)
+            })
+
+    # Sort descending and take Top 5
+    sentence_exp.sort(key=lambda x: x["similarity"], reverse=True)
+    sentence_level_json = json.dumps(sentence_exp[:5])
+
+    # ------------------------------------------------------------------
+    # C. WORD LEVEL (Top 10)
+    # ------------------------------------------------------------------
+    # Regex findall from friend's code
+    words = re.findall(r"\b\w+\b", content)
+    
+    word_exp = []
+    if words:
+        # Deduplicate while preserving order (friend's logic)
+        seen = set()
+        uniq_words = []
+        for w in words:
+            wlow = w.lower()
+            if wlow not in seen:
+                seen.add(wlow)
+                uniq_words.append(w)
+        
+        # Calculate scores
+        for w in uniq_words:
+            word_vec = EMBEDDINGS.embed(w, request_id)
+            if not word_vec: continue
+            
+            best_t = None
+            best_s = -1.0
+            
+            for t_name, t_vec in topic_vectors.items():
+                score = cosine_similarity(word_vec, t_vec)
+                if score > best_s:
+                    best_s = score
+                    best_t = t_name
+            
+            word_exp.append((w, best_t, float(best_s)))
+
+    # Sort descending and take Top 10
+    word_exp.sort(key=lambda x: x[2], reverse=True)
+    word_level_json = json.dumps(word_exp[:10])
+    
+    return secondary_topics_json, sentence_level_json, word_level_json
+
+# ============================================================
+# MAIN TOOL FUNCTION
+# ============================================================
+# ============================================================
+# MAIN TOOL FUNCTION (With Duplicate Protection)
+# ============================================================
 def vectorize_and_insert_post(
     post_number: int,
     post_title: str,
@@ -1395,17 +1539,11 @@ def vectorize_and_insert_post(
     post_date: str,
     final_topic: str,
     topic_confidence: float,
-    secondary_topics: str = "",
-    sentence_level_explanation: str = "",
-    word_level_explanation: str = "",
 ) -> Dict[str, Any]:
     """
-    Vectorize a DailyPost (all fields combined) and insert into Weaviate.
-    Combines title, content, and all explanations into a single vector.
-    Strictly follows Post and Chunk schema (Weaviate v4).
-    Before assigning the topics, first use list_all_topics to verify they exist, and ONLY USE THOSE TOPICS FOR THE POSTS.
+    Vectorize a DailyPost and insert into Weaviate.
+    Includes DUPLICATE PROTECTION: Fails if post_number already exists.
     """
-    # Import UUID generator locally
     from weaviate.util import generate_uuid5
     
     request_id = f"vectorize_insert_{int(time.time() * 1000)}"
@@ -1415,25 +1553,41 @@ def vectorize_and_insert_post(
         # 1. Validate inputs
         post_number = int(post_number)
         topic_confidence = float(topic_confidence)
-        
-        # 2. Date Safety (Uses the helper defined ABOVE)
         formatted_date = _parse_date_to_rfc3339(post_date)
 
-        # 3. Combine text for Post embedding
-        combined_text = (
-            f"{post_title} {post_content} {secondary_topics} "
-            f"{sentence_level_explanation} {word_level_explanation}"
-        ).strip()
+        # 2. Get Client
+        client = get_weaviate_client(request_id)
+        post_collection = client.collections.get(CFG.POST_COLLECTION)
+
+        # ============================================================
+        # NEW: DUPLICATE CHECK
+        # ============================================================
+        # Query to see if this post_number already exists
+        existing_check = post_collection.query.fetch_objects(
+            filters=Filter.by_property("post_number").equal(post_number),
+            limit=1
+        )
         
-        if not combined_text:
-            raise ValueError("All text fields are empty")
-        
-        # 4. Generate Post Embedding
+        if len(existing_check.objects) > 0:
+            return {
+                "success": False,
+                "post_number": post_number,
+                "error": f"Post #{post_number} already exists. Use 'delete_post_by_number' first if you want to overwrite it."
+            }
+        # ============================================================
+
+        # 3. Generate Embedding
+        combined_text = f"{post_title} {post_content}".strip()
         post_vector = EMBEDDINGS.embed(combined_text, request_id=request_id)
         if post_vector is None:
-            raise RuntimeError("Failed to generate embedding for post (model error)")
-        
-        # 5. Prepare Properties (EXCLUDING vector)
+            raise RuntimeError("Failed to generate embedding")
+
+        # 4. Calculate Stats (Friend's Logic)
+        sec_json, sent_json, word_json = _generate_stats(
+            post_content, post_vector, final_topic, request_id, client
+        )
+
+        # 5. Insert Post
         post_properties = {
             "post_number": post_number,
             "post_title": post_title,
@@ -1441,77 +1595,50 @@ def vectorize_and_insert_post(
             "post_date": formatted_date,
             "final_topic": final_topic,
             "topic_confidence": topic_confidence,
-            "secondary_topics": secondary_topics,
-            "sentence_level_explanation": sentence_level_explanation,
-            "word_level_explanation": word_level_explanation,
+            "secondary_topics": sec_json,       
+            "sentence_level_explanation": sent_json, 
+            "word_level_explanation": word_json,     
         }
         
-        # 6. Insert Post (Vector passed separately)
-        def _insert_post(client):
-            post_collection = client.collections.get(CFG.POST_COLLECTION)
-            return post_collection.data.insert(
-                properties=post_properties, 
-                vector=post_vector
-            )
+        post_id = post_collection.data.insert(
+            properties=post_properties, 
+            vector=post_vector
+        )
         
-        post_id = weaviate_call("vectorize_insert.post", request_id=request_id, fn=_insert_post)
-        
-        # 7. Chunking Strategy
+        # 6. Process Chunks
         chunks = _chunk_text(post_content)
         chunk_ids = []
+        chunk_collection = client.collections.get(CFG.CHUNK_COLLECTION)
         
         for chunk_num, chunk_text in enumerate(chunks):
-            # Embed the individual chunk
             chunk_vector = EMBEDDINGS.embed(chunk_text, request_id=request_id)
-            if chunk_vector is None:
-                log_event("WARNING", "Chunk embedding failed", request_id=request_id, chunk_num=chunk_num)
-                continue
+            if chunk_vector is None: continue
             
             chunk_properties = {
                 "post_number": post_number,
                 "chunk_number": chunk_num,
                 "chunk_text": chunk_text,
             }
-            
-            # Deterministic UUID prevents duplicate chunks
             chunk_uuid = generate_uuid5(f"{post_number}_{chunk_num}")
             
-            def _insert_chunk(client):
-                chunk_collection = client.collections.get(CFG.CHUNK_COLLECTION)
-                return chunk_collection.data.insert(
-                    properties=chunk_properties,
-                    vector=chunk_vector,
-                    uuid=chunk_uuid
-                )
-            
-            chunk_id = weaviate_call(f"vectorize_insert.chunk.{chunk_num}", request_id=request_id, fn=_insert_chunk)
-            chunk_ids.append(chunk_id)
-        
-        log_event(
-            "INFO",
-            "Vectorize and insert completed",
-            request_id=request_id,
-            post_number=post_number,
-            chunks_created=len(chunk_ids),
-            total_ms=int((_now_s() - t0) * 1000),
-        )
+            chunk_collection.data.insert(
+                properties=chunk_properties,
+                vector=chunk_vector,
+                uuid=chunk_uuid
+            )
+            chunk_ids.append(chunk_uuid)
         
         return {
             "success": True,
             "post_number": post_number,
-            "post_id": str(post_id),
-            "date_stored": formatted_date,
+            "final_topic": final_topic,
             "chunks_created": len(chunk_ids),
-            "message": f"Successfully inserted post #{post_number} with {len(chunk_ids)} chunks",
+            "message": f"Saved post #{post_number} under topic '{final_topic}'."
         }
         
     except Exception as e:
         log_event("ERROR", "Vectorize insert failed", request_id=request_id, post_number=post_number, error=str(e))
-        return {
-            "success": False,
-            "error": str(e),
-            "post_number": post_number,
-        }
+        return {"success": False, "error": str(e), "post_number": post_number}
 
 def delete_post(post_number: int) -> Dict[str, Any]:
     """
