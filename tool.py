@@ -503,6 +503,7 @@ def register_tools():
     mcp.tool()(search_chunks)
     mcp.tool()(get_style_guide)
     mcp.tool()(vectorize_and_insert_post)
+    mcp.tool()(delete_post)
 
 # ============================================================
 # Tools
@@ -1511,6 +1512,41 @@ def vectorize_and_insert_post(
             "error": str(e),
             "post_number": post_number,
         }
+
+def delete_post(post_number: int) -> Dict[str, Any]:
+    """
+    Deletes a post AND all its associated chunks from Weaviate by post_number.
+    """
+    request_id = f"delete_post_{int(time.time())}"
+    # Reuse the existing persistent client from tool.py
+    client = get_weaviate_client(request_id)
+    
+    try:
+        post_number = int(post_number)
+        
+        # 1. Delete from 'Post' Collection
+        post_collection = client.collections.get(CFG.POST_COLLECTION)
+        post_res = post_collection.data.delete_many(
+            where=Filter.by_property("post_number").equal(post_number)
+        )
+
+        # 2. Delete from 'Chunk' Collection
+        chunk_collection = client.collections.get(CFG.CHUNK_COLLECTION)
+        chunk_res = chunk_collection.data.delete_many(
+            where=Filter.by_property("post_number").equal(post_number)
+        )
+
+        return {
+            "success": True,
+            "post_number": post_number,
+            "posts_deleted": post_res.successful,
+            "chunks_deleted": chunk_res.successful,
+            "failed_count": post_res.failed + chunk_res.failed
+        }
+        
+    except Exception as e:
+        log_event("ERROR", "Delete post failed", request_id=request_id, error=str(e))
+        return {"success": False, "error": str(e), "post_number": post_number}
 
 # ============================================================
 # Optional: controlled shutdown hook
