@@ -14,15 +14,18 @@ Based on Phase 1, select the correct bridge:
 * [cite_start]New Territory: Start immediately with a declarative hook from Phase 3 [cite: 106-107].
 
 PHASE 3: STRUCTURAL BLUEPRINT
-Format: "DailyPost [INSERT NUMBER]"
-Length: 80-150 words (4-5 paragraphs total).
+Format: "DailyPost [####]"
+Length: 100-150 words (4 paragraphs total).
 * [cite_start]TITLE: ALL CAPS, Provocative (e.g., "IS SERVILITY OUR DNA?" or "VALUE Vs VALUATION") [cite: 115-118].
 * PARA 1 (HOOK): Use historical framing or direct challenges.
   - Required Openers: "The year [YEAR] would go down in history as..." OR "Is X equal to Y?" [cite_start]OR "[Topic] is no one's job" [cite: 121-123].
-* PARA 2-4 (ANALYSIS): Highlight institutional gaps/failures.
+* PARA 2 (ANALYSIS): Highlight institutional gaps/failures.
   - [cite_start]Must Include: A "questions cascade" (2-3 rhetorical questions in a row) [cite: 130-132].
-  - [cite_start]Sentence Structure: Mix "While X, Y" contrasts with emphatic short sentences (e.g., "The task is humongous")[cite: 176].
-* PARA 5 (CLOSING): Synthesis + broader implication.
+  - [cite_start]End with emphatic short sentence (e.g., "The task is humongous")[cite: 176].
+* PARA 3 (SYNTHESIS): Solutions and broader implications.
+  - [cite_start]Sentence Structure: Mix "While X, Y" contrasts with emphatic statements[cite: 176].
+  - Bridge institutional gaps to larger context.
+* PARA 4 (CLOSING): 
   - [cite_start]Format: End with an ALL CAPS SUMMARY STATEMENT (8-15 words) following the pattern: "TOPIC IS/REMAINS ASSESSMENT—ULTIMATE QUESTION"[cite: 147].
   - [cite_start]Signature: "Sanjay Sahay"[cite: 148].
 
