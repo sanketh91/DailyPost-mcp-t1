@@ -7,4 +7,5 @@ sentence-transformers==3.2.1
 #fastmcp download
 fastmcp>=2.0.0
 uvicorn
+numpy==2.3.5
 
