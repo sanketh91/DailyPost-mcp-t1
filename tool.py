@@ -49,7 +49,7 @@ class Config:
 
     # Timeouts (seconds)
     TOOL_TIMEOUT_S: float = float(os.getenv("TOOL_TIMEOUT_S", "30"))
-    EMBED_TIMEOUT_S: float = float(os.getenv("EMBED_TIMEOUT_S", "8"))
+    EMBED_TIMEOUT_S: float = float(os.getenv("EMBED_TIMEOUT_S", "20.0"))
     WEAVIATE_QUERY_TIMEOUT_S: float = float(os.getenv("WEAVIATE_QUERY_TIMEOUT_S", "20"))
 
     # Weaviate health / reconnect
@@ -66,6 +66,7 @@ class Config:
 
     # Embeddings
     EMBEDDING_MODEL_NAME: str = os.getenv("EMBEDDING_MODEL_NAME", "all-mpnet-base-v2")
+    LOCAL_MODEL_PATH: str = os.getenv("LOCAL_MODEL_PATH", "/app/cache/all-mpnet-base-v2")
     MODEL_DIMENSION: int = int(os.getenv("MODEL_DIMENSION", "768"))
     EAGER_LOAD_EMBEDDINGS: bool = os.getenv("EAGER_LOAD_EMBEDDINGS", "1") == "1"
 
@@ -277,9 +278,15 @@ class EmbeddingManager:
             self._load_attempted = True
             t0 = _now_s()
             try:
-                log_event("INFO", "Loading embedding model", model=CFG.EMBEDDING_MODEL_NAME)
-                self._model = SentenceTransformer(CFG.EMBEDDING_MODEL_NAME)
-                log_event("INFO", "Embedding model loaded", model=CFG.EMBEDDING_MODEL_NAME, load_ms=int((_now_s() - t0) * 1000))
+                # Prefer local path if it exists to avoid download hangs
+                model_path = CFG.EMBEDDING_MODEL_NAME
+                if os.path.exists(CFG.LOCAL_MODEL_PATH):
+                    model_path = CFG.LOCAL_MODEL_PATH
+                    log_event("INFO", "Using local embedding model path", path=model_path)
+                
+                log_event("INFO", "Loading embedding model", model=model_path)
+                self._model = SentenceTransformer(model_path)
+                log_event("INFO", "Embedding model loaded", model=model_path, load_ms=int((_now_s() - t0) * 1000))
                 return self._model
             except Exception as e:
                 self._load_error = str(e)
@@ -606,10 +613,11 @@ def search_posts_hybrid(
             "query": query,
             "total_results": len(formatted_results),
             "search_params": {
-                "alpha": alpha, 
-                "limit": limit, 
-                "filters_applied": bool(filters),
-                "embedding_used": embedding_used
+                "alpha": alpha if query_vector is not None else 0.0,
+                "limit": limit,
+                "filters_applied": bool(start_date and end_date) or bool(topic_filter),
+                "embedding_used": query_vector is not None,
+                "fallback_reason": None if query_vector is not None else "Embedding model timeout or initialization failure; fell back to keyword-only (BM25) search."
             },
             "results": formatted_results,
         }
