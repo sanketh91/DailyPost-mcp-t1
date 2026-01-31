@@ -518,6 +518,7 @@ def register_tools():
 # Tools
 # ============================================================
 
+
 def search_posts_hybrid(
     query: str,
     limit: int = 10,
@@ -535,76 +536,85 @@ def search_posts_hybrid(
     client = get_weaviate_client(request_id)
     
     try:
+        # 1. Try to generate vector using your Robust Embedding Manager
         try:
-            query_vector = get_embedding_for_query(query)
-            embedding_used = True
+            # CRITICAL FIX: Use EMBEDDINGS.embed instead of get_embedding_for_query
+            query_vector = EMBEDDINGS.embed(query, request_id)
+            embedding_used = (query_vector is not None)
         except Exception as e:
-            logger.warning(f"Failed to generate query vector, falling back to keyword-only: {e}")
+            log_event("WARNING", "Vector generation failed, falling back to keyword", error=str(e))
             query_vector = None
             embedding_used = False
 
-        post_collection = client.collections.get("Post")
+        post_collection = client.collections.get(CFG.POST_COLLECTION)
         filters = []
         
+        # 2. Build Date Filters
         if start_date and end_date:
-            start_dt = _parse_date_input(start_date).replace(hour=0, minute=0, second=0)
-            end_dt = _parse_date_input(end_date).replace(hour=23, minute=59, second=59)
-            start_iso = start_dt.isoformat() + "Z"
-            end_iso = end_dt.isoformat() + "Z"
-            filters.append(
-                Filter.by_property("post_date").greater_or_equal(start_iso)
-                & Filter.by_property("post_date").less_or_equal(end_iso)
-            )
+            try:
+                # Ensure ISO format with Z
+                s_iso = f"{start_date}T00:00:00Z" if "T" not in start_date else start_date
+                e_iso = f"{end_date}T23:59:59Z" if "T" not in end_date else end_date
+                
+                filters.append(
+                    Filter.by_property("post_date").greater_or_equal(s_iso)
+                    & Filter.by_property("post_date").less_or_equal(e_iso)
+                )
+            except Exception:
+                pass # Ignore invalid dates
 
+        # 3. Build Topic Filter
         if topic_filter:
             filters.append(Filter.by_property("final_topic").equal(topic_filter))
 
-        combined_filter = (
-            filters[0] if len(filters) == 1 
-            else (filters[0] & filters[1] if len(filters) == 2 else None)
-        )
+        # 4. Combine Filters
+        combined_filter = None
+        if len(filters) == 1:
+            combined_filter = filters[0]
+        elif len(filters) == 2:
+            combined_filter = filters[0] & filters[1]
 
-        # Use hybrid search if we have embeddings, otherwise fall back to keyword search
+        # 5. Execute Search (Hybrid vs BM25 Fallback)
+        common_props = [
+            "post_number", "post_title", "post_content", "final_topic",
+            "topic_confidence", "post_date", "secondary_topics"
+        ]
+
         if query_vector is not None:
+            # TRUE HYBRID
             results = post_collection.query.hybrid(
                 query=query,
                 vector=query_vector,
                 alpha=alpha,
                 limit=limit,
                 filters=combined_filter,
-                query_properties=["post_content", "post_title", "final_topic"],
                 return_metadata=MetadataQuery(score=True) if include_scores else None,
-                return_properties=[
-                    "post_number", "post_title", "post_content", "final_topic",
-                    "topic_confidence", "post_date", "secondary_topics",
-                ],
+                return_properties=common_props,
             )
         else:
-            # Fallback to BM25 keyword search
+            # KEYWORD FALLBACK (Safety Net)
             results = post_collection.query.bm25(
                 query=query,
                 limit=limit,
                 filters=combined_filter,
-                query_properties=["post_content", "post_title", "final_topic"],
                 return_metadata=MetadataQuery(score=True) if include_scores else None,
-                return_properties=[
-                    "post_number", "post_title", "post_content", "final_topic",
-                    "topic_confidence", "post_date", "secondary_topics",
-                ],
+                return_properties=common_props,
             )
 
+        # 6. Format Results
         formatted_results = []
         for obj in results.objects:
+            p = obj.properties
             result = {
-                "post_number": obj.properties.get("post_number"),
-                "title": obj.properties.get("post_title"),
-                "content": obj.properties.get("post_content", "")[:300] + "...",
-                "primary_topic": obj.properties.get("final_topic"),
-                "topic_confidence": obj.properties.get("topic_confidence"),
-                "date": _format_date(obj.properties.get("post_date")),
-                "secondary_topics": obj.properties.get("secondary_topics"),
+                "post_number": p.get("post_number"),
+                "title": p.get("post_title"),
+                "content": (p.get("post_content") or "")[:300] + "...",
+                "primary_topic": p.get("final_topic"),
+                "topic_confidence": p.get("topic_confidence"),
+                "date": _format_date(p.get("post_date")),
+                "secondary_topics": p.get("secondary_topics"),
             }
-            if include_scores and hasattr(obj.metadata, "score"):
+            if include_scores and obj.metadata:
                 result["relevance_score"] = obj.metadata.score
             formatted_results.append(result)
 
@@ -613,19 +623,17 @@ def search_posts_hybrid(
             "query": query,
             "total_results": len(formatted_results),
             "search_params": {
-                "alpha": alpha if query_vector is not None else 0.0,
+                "alpha": alpha if embedding_used else 0.0,
                 "limit": limit,
-                "filters_applied": bool(start_date and end_date) or bool(topic_filter),
-                "embedding_used": query_vector is not None,
-                "fallback_reason": None if query_vector is not None else "Embedding model timeout or initialization failure; fell back to keyword-only (BM25) search."
+                "filters_applied": len(filters) > 0,
+                "embedding_used": embedding_used,
+                "fallback_reason": None if embedding_used else "Embedding model timeout or failure"
             },
             "results": formatted_results,
         }
+        
     except Exception as e:
         return {"success": False, "error": str(e), "query": query}
-    finally:
-        if client:
-            client.close()
 
 
 def search_by_date_range(
@@ -1549,8 +1557,10 @@ def vectorize_and_insert_post(
     topic_confidence: float,
 ) -> Dict[str, Any]:
     """
-    Vectorize a DailyPost and insert into Weaviate.
-    Includes DUPLICATE PROTECTION: Fails if post_number already exists.
+    Vectorize a DailyPost (Post_Title and Post_Content) and insert into Weaviate.
+    Combines title, content, and all explanations into a single vector.
+    Strictly follows Post and Chunk schema (Weaviate v4).
+    Before assigning the topics, first use list_all_topics to verify they exist, and ONLY USE THOSE TOPICS FOR THE POSTS.
     """
     from weaviate.util import generate_uuid5
     
