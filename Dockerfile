@@ -8,6 +8,7 @@ COPY mcp_server.py .
 COPY tool.py .
 COPY dynamic_tools_framework.py .
 COPY dynamic_tool_registry.py .
+COPY sanjay_sahay_style.txt .
 RUN mkdir -p /app/dynamictoolsstorage
 
 EXPOSE 8080
