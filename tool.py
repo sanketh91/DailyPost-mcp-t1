@@ -1557,8 +1557,10 @@ def vectorize_and_insert_post(
     topic_confidence: float,
 ) -> Dict[str, Any]:
     """
-    Vectorize a DailyPost and insert into Weaviate.
-    Includes DUPLICATE PROTECTION: Fails if post_number already exists.
+    Vectorize a DailyPost (Post_Title and Post_Content) and insert into Weaviate.
+    Combines title, content, and all explanations into a single vector.
+    Strictly follows Post and Chunk schema (Weaviate v4).
+    Before assigning the topics, first use list_all_topics to verify they exist, and ONLY USE THOSE TOPICS FOR THE POSTS.
     """
     from weaviate.util import generate_uuid5
     
